@@ -1,0 +1,27 @@
+{
+  "ocr": {
+    "max_dimension": 800,
+    "duration": 600,
+    "frame_interval": 1.0,
+    "match_threshold": 0.6,
+    "hwaccel": "videotoolbox"
+  },
+  "show": {
+    "show_name": "Star Trek: The Next Generation",
+    "season": 1,
+    "tmdb_api_key": "22fda6c45f55b8ee4435f7c04ae19a17",
+    "input_directory": "~/rips/Star_Trek_TNG/Season_1/"
+  },
+  "comments": {
+    "max_dimension": "Max frame dimension in pixels (null for full resolution, or 800 for faster processing)",
+    "duration": "Max duration to process in seconds (null for full video, or 600 for first 10 minutes)",
+    "frame_interval": "Interval between frames in seconds (default: 1.0-2.0 recommended)",
+    "match_threshold": "Episode matching threshold (0.0-1.0, default: 0.6)",
+    "hwaccel": "Hardware acceleration for decoding (null for software, 'videotoolbox' for macOS, 'vaapi' for Linux, 'd3d11va'/'dxva2' for Windows)",
+    "show_name": "TV show name for TMDB lookup (required if using TMDB)",
+    "season": "Season number (required if using TMDB)",
+    "tmdb_api_key": "TMDB API key (null to use TMDB_API_KEY environment variable)",
+    "input_directory": "Directory path containing video files to process (all .mkv files will be processed)",
+    "episode_titles": "Optional manual episode titles to append to TMDB results (used for fuzzy matching)"
+  }
+}
