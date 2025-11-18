@@ -73,109 +73,46 @@ def match_episode(
             normalized_episode = normalized_episode.replace(punct, ' ')
         normalized_episode = ' '.join(normalized_episode.split())
         
-        # Calculate multiple similarity scores
-        # 1. Full ratio - exact string matching
-        full_score = fuzz.ratio(normalized_extracted, normalized_episode) / 100.0
-        
-        # 2. Token sort ratio - order-independent matching (good for OCR errors)
-        token_sort_score = fuzz.token_sort_ratio(normalized_extracted, normalized_episode) / 100.0
-        
-        # 3. Token set ratio - best for matching when words are jumbled
-        token_set_score = fuzz.token_set_ratio(normalized_extracted, normalized_episode) / 100.0
-        
-        # 4. Partial ratio - but only use if extracted text is substantial
-        # Only use partial_ratio if we have a reasonable amount of text
-        partial_score = 0.0
-        if len(normalized_extracted) >= 20:  # Only use partial for longer extracts
-            partial_score = fuzz.partial_ratio(normalized_extracted, normalized_episode) / 100.0
-            # Penalize partial matches - they're less reliable
-            partial_score = partial_score * 0.75
-        
-        # Check if this is a single-word episode title
+        # Special handling for single-word episode titles to avoid false positives
+        # (e.g., "haven" matching "haven't" or "behaven")
         episode_words_list = normalized_episode.split()
         is_single_word = len(episode_words_list) == 1
         
-        # For single-word titles, require stricter matching to avoid false positives
-        # (e.g., "haven" matching "haven't" or "behaven")
         if is_single_word:
             episode_word = episode_words_list[0]
-            # Check if the episode word appears as a complete word (with word boundaries)
-            # Split extracted text into words and check for exact or fuzzy match
             extracted_words_list = normalized_extracted.split()
             word_found_as_standalone = False
             
+            # Check if episode word appears as a standalone word
             for ext_word in extracted_words_list:
-                # Check exact match first
+                # Exact match
                 if ext_word == episode_word:
                     word_found_as_standalone = True
                     break
-                # Check fuzzy match (for OCR errors) but require high similarity
+                # Fuzzy match for OCR errors (require high similarity)
                 if len(ext_word) >= len(episode_word) * 0.8 and len(ext_word) <= len(episode_word) * 1.2:
                     word_ratio = fuzz.ratio(episode_word, ext_word) / 100.0
-                    if word_ratio >= 0.85:  # Require 85% similarity for single-word matches
+                    if word_ratio >= 0.85:  # Require 85% similarity
                         word_found_as_standalone = True
                         break
             
-            # If single-word title doesn't appear as standalone word, heavily penalize
+            # If single-word title doesn't appear as standalone, skip it
+            # (avoids false positives like "haven" in "haven't")
             if not word_found_as_standalone:
-                # Still allow partial matches but with heavy penalty
-                # This handles cases where OCR might have added/removed characters
-                partial_word_score = 0.0
-                for ext_word in extracted_words_list:
-                    if episode_word in ext_word or ext_word in episode_word:
-                        # Check if it's a reasonable substring match (not just "haven" in "haven't")
-                        if abs(len(ext_word) - len(episode_word)) <= 2:
-                            partial_word_score = max(partial_word_score, fuzz.ratio(episode_word, ext_word) / 100.0)
-                
-                if partial_word_score < 0.9:  # Require very high similarity for substring matches
-                    # This is likely a false positive (e.g., "haven" in "haven't")
-                    # Skip this episode entirely
-                    continue
+                continue
         
-        # Use weighted combination - prefer token_set_ratio and token_sort_ratio
-        # as they're more robust to OCR errors, but require substantial overlap
-        # For Tesseract which makes more character-level errors, be more lenient
-        score = max(
-            token_set_score * 1.0,      # Best for jumbled words
-            token_sort_score * 0.95,    # Good for reordered words
-            partial_score,              # Good for partial matches (if substantial)
-            full_score * 0.9            # Exact match bonus
-        )
+        # Use 2-3 simple matching strategies
+        # 1. Token set ratio - best for jumbled words (most robust for OCR)
+        token_set_score = fuzz.token_set_ratio(normalized_extracted, normalized_episode) / 100.0
         
-        # Additional check: require that at least 30% of episode words appear in extracted text
-        # But use fuzzy word matching to handle OCR character errors (e.g., "moday" vs "today")
-        episode_words = set(w for w in normalized_episode.split() if len(w) > 2)
-        extracted_words = set(w for w in normalized_extracted.split() if len(w) > 2)
+        # 2. Token sort ratio - good for reordered words
+        token_sort_score = fuzz.token_sort_ratio(normalized_extracted, normalized_episode) / 100.0
         
-        if episode_words:
-            # Use fuzzy word matching to handle OCR errors
-            matched_words = 0
-            for ep_word in episode_words:
-                # Check if word appears exactly
-                if ep_word in extracted_words:
-                    matched_words += 1
-                else:
-                    # Try fuzzy matching for OCR errors (e.g., "moday" vs "today")
-                    best_fuzzy_score = 0
-                    for ext_word in extracted_words:
-                        # Use partial_ratio for character-level OCR errors
-                        fuzzy_score = fuzz.partial_ratio(ep_word, ext_word) / 100.0
-                        # Also check if words are similar length (OCR errors usually preserve length)
-                        if abs(len(ep_word) - len(ext_word)) <= 2:
-                            fuzzy_score = max(fuzzy_score, fuzz.ratio(ep_word, ext_word) / 100.0)
-                        best_fuzzy_score = max(best_fuzzy_score, fuzzy_score)
-                    
-                    # Consider it a match if fuzzy score > 0.7 (handles OCR errors like "moday"/"today")
-                    if best_fuzzy_score > 0.7:
-                        matched_words += best_fuzzy_score  # Partial credit for fuzzy matches
-            
-            word_overlap = matched_words / len(episode_words)
-            # Require at least 30% word overlap, or scale down the score
-            if word_overlap < 0.3:
-                score = score * 0.5  # Heavily penalize low word overlap
-            elif word_overlap < 0.5:
-                # Give partial boost for moderate word overlap
-                score = score * (0.7 + word_overlap * 0.6)  # Scale between 0.7 and 1.0
+        # 3. Full ratio - exact string matching (bonus for perfect matches)
+        full_score = fuzz.ratio(normalized_extracted, normalized_episode) / 100.0
+        
+        # Use the best score from these strategies
+        score = max(token_set_score, token_sort_score, full_score * 0.9)
         
         if score > best_score:
             best_score = score
@@ -242,91 +179,35 @@ def match_episode_with_scores(
             normalized_episode = normalized_episode.replace(punct, ' ')
         normalized_episode = ' '.join(normalized_episode.split())
         
-        # Calculate multiple similarity scores
-        full_score = fuzz.ratio(normalized_extracted, normalized_episode) / 100.0
-        token_sort_score = fuzz.token_sort_ratio(normalized_extracted, normalized_episode) / 100.0
-        token_set_score = fuzz.token_set_ratio(normalized_extracted, normalized_episode) / 100.0
-        
-        partial_score = 0.0
-        if len(normalized_extracted) >= 20:
-            partial_score = fuzz.partial_ratio(normalized_extracted, normalized_episode) / 100.0
-            partial_score = partial_score * 0.75
-        
-        # Check if this is a single-word episode title
+        # Special handling for single-word episode titles (same as match_episode)
         episode_words_list = normalized_episode.split()
         is_single_word = len(episode_words_list) == 1
         
-        # For single-word titles, require stricter matching to avoid false positives
-        # (e.g., "haven" matching "haven't" or "behaven")
         if is_single_word:
             episode_word = episode_words_list[0]
-            # Check if the episode word appears as a complete word (with word boundaries)
-            # Split extracted text into words and check for exact or fuzzy match
             extracted_words_list = normalized_extracted.split()
             word_found_as_standalone = False
             
             for ext_word in extracted_words_list:
-                # Check exact match first
                 if ext_word == episode_word:
                     word_found_as_standalone = True
                     break
-                # Check fuzzy match (for OCR errors) but require high similarity
                 if len(ext_word) >= len(episode_word) * 0.8 and len(ext_word) <= len(episode_word) * 1.2:
                     word_ratio = fuzz.ratio(episode_word, ext_word) / 100.0
-                    if word_ratio >= 0.85:  # Require 85% similarity for single-word matches
+                    if word_ratio >= 0.85:
                         word_found_as_standalone = True
                         break
             
-            # If single-word title doesn't appear as standalone word, heavily penalize
             if not word_found_as_standalone:
-                # Still allow partial matches but with heavy penalty
-                # This handles cases where OCR might have added/removed characters
-                partial_word_score = 0.0
-                for ext_word in extracted_words_list:
-                    if episode_word in ext_word or ext_word in episode_word:
-                        # Check if it's a reasonable substring match (not just "haven" in "haven't")
-                        if abs(len(ext_word) - len(episode_word)) <= 2:
-                            partial_word_score = max(partial_word_score, fuzz.ratio(episode_word, ext_word) / 100.0)
-                
-                if partial_word_score < 0.9:  # Require very high similarity for substring matches
-                    # This is likely a false positive (e.g., "haven" in "haven't")
-                    # Skip this episode entirely
-                    scores[episode_name] = 0.0  # Set score to 0 instead of skipping
-                    continue
+                scores[episode_name] = 0.0  # Set score to 0 instead of skipping
+                continue
         
-        score = max(
-            token_set_score * 1.0,
-            token_sort_score * 0.95,
-            partial_score,
-            full_score * 0.9
-        )
+        # Use same 2-3 simple matching strategies as match_episode
+        token_set_score = fuzz.token_set_ratio(normalized_extracted, normalized_episode) / 100.0
+        token_sort_score = fuzz.token_sort_ratio(normalized_extracted, normalized_episode) / 100.0
+        full_score = fuzz.ratio(normalized_extracted, normalized_episode) / 100.0
         
-        # Word overlap check
-        episode_words = set(w for w in normalized_episode.split() if len(w) > 2)
-        extracted_words = set(w for w in normalized_extracted.split() if len(w) > 2)
-        
-        if episode_words:
-            matched_words = 0
-            for ep_word in episode_words:
-                if ep_word in extracted_words:
-                    matched_words += 1
-                else:
-                    best_fuzzy_score = 0
-                    for ext_word in extracted_words:
-                        fuzzy_score = fuzz.partial_ratio(ep_word, ext_word) / 100.0
-                        if abs(len(ep_word) - len(ext_word)) <= 2:
-                            fuzzy_score = max(fuzzy_score, fuzz.ratio(ep_word, ext_word) / 100.0)
-                        best_fuzzy_score = max(best_fuzzy_score, fuzzy_score)
-                    
-                    if best_fuzzy_score > 0.7:
-                        matched_words += best_fuzzy_score
-            
-            word_overlap = matched_words / len(episode_words)
-            if word_overlap < 0.3:
-                score = score * 0.5
-            elif word_overlap < 0.5:
-                score = score * (0.7 + word_overlap * 0.6)
-        
+        score = max(token_set_score, token_sort_score, full_score * 0.9)
         scores[episode_name] = score
         
         if score > best_score:

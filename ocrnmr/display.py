@@ -56,49 +56,8 @@ class OCRProgressDisplay:
         self.running = False
         self.early_exit_requested = False
         
-        # Terminal dimensions (calculated once at startup)
-        terminal_width, terminal_height = self._get_terminal_size()
-        
-        # Ensure minimum terminal size - if too small, use minimums
-        MIN_WIDTH = 80
-        MIN_HEIGHT = 24
-        terminal_width = max(MIN_WIDTH, terminal_width)
-        terminal_height = max(MIN_HEIGHT, terminal_height)
-        
-        self.terminal_width = terminal_width
-        self.terminal_height = terminal_height
-        
-        # Derived dimensions (calculated once at startup)
-        # Top and bottom sections split terminal height 50/50
-        self.top_section_height = terminal_height // 2
-        self.bottom_section_height = terminal_height - self.top_section_height
-        
-        # Ensure both sections have minimum size
-        MIN_SECTION_HEIGHT = 10
-        if self.top_section_height < MIN_SECTION_HEIGHT:
-            self.top_section_height = MIN_SECTION_HEIGHT
-            self.bottom_section_height = terminal_height - self.top_section_height
-        if self.bottom_section_height < MIN_SECTION_HEIGHT:
-            self.bottom_section_height = MIN_SECTION_HEIGHT
-            self.top_section_height = terminal_height - self.bottom_section_height
-        
-        # Pane width: split terminal width equally
-        calculated_pane_width = terminal_width // 2
-        self.pane_width = max(30, calculated_pane_width)  # Minimum 30 chars per pane
-        
-        # Activity log max lines (calculated once)
-        fixed_lines = 7  # Header, quit message, blank, file info, blank, status, separator
-        self.activity_log_max_lines = max(3, self.top_section_height - fixed_lines - 2)  # Minimum 3 lines
-        
-    def _get_terminal_size(self) -> Tuple[int, int]:
-        """Get terminal dimensions (only called once during initialization)."""
-        try:
-            import shutil
-            size = shutil.get_terminal_size()
-            return (size.columns, size.lines)
-        except Exception:
-            # Defaults if we can't determine terminal size
-            return (80, 50)
+        # Activity log max lines
+        self.activity_log_max_lines = 10  # Fixed number of log lines to show
     
     def _get_ocr_pane_content(self) -> Panel:
         """Get content for OCR pane as a rich Panel."""
@@ -133,8 +92,7 @@ class OCRProgressDisplay:
             # Show error message prominently if present
             if self.error_message:
                 content_lines.append(Text("\n"))
-                separator_width = min(40, self.pane_width - 2)
-                content_lines.append(Text("─" * separator_width + "\n", style="red"))
+                content_lines.append(Text("─" * 40 + "\n", style="red"))
                 content_lines.append(Text("ERROR:\n", style="bold red"))
                 # Split error message into lines and display
                 for line in self.error_message.split('\n'):
@@ -144,8 +102,7 @@ class OCRProgressDisplay:
             # Show activity log - newest at top (bottom-up scrolling)
             if self.ocr_diagnostics:
                 content_lines.append(Text("\n"))
-                separator_width = min(40, self.pane_width - 2)
-                content_lines.append(Text("─" * separator_width + "\n", style="dim"))
+                content_lines.append(Text("─" * 40 + "\n", style="dim"))
                 content_lines.append(Text("Activity Log:\n", style="dim"))
                 # Get most recent messages and reverse them (newest first)
                 all_messages = list(self.ocr_diagnostics)
@@ -163,7 +120,7 @@ class OCRProgressDisplay:
                 combined_text,
                 title="OCR Processing",
                 border_style="green",
-                width=self.pane_width
+                width=None  # Use full available width from layout
             )
     
     def _get_ffmpeg_pane_content(self) -> Panel:
@@ -244,8 +201,7 @@ class OCRProgressDisplay:
             # Show activity log - newest at top (bottom-up scrolling)
             if self.ffmpeg_log:
                 content_lines.append(Text("\n"))
-                separator_width = min(40, self.pane_width - 2)
-                content_lines.append(Text("─" * separator_width + "\n", style="dim"))
+                content_lines.append(Text("─" * 40 + "\n", style="dim"))
                 content_lines.append(Text("Activity Log:\n", style="dim"))
                 # Get most recent messages and reverse them (newest first)
                 all_messages = list(self.ffmpeg_log)
@@ -263,7 +219,7 @@ class OCRProgressDisplay:
                 combined_text,
                 title="FFMPEG Extraction",
                 border_style="green",
-                width=self.pane_width
+                width=None  # Use full available width from layout
             )
     
     def _get_summary_pane_content(self) -> Panel:

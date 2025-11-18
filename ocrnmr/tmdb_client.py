@@ -44,28 +44,6 @@ class TMDBClient:
             for show in results
         ]
 
-    def get_episode_info(self, show_id: int, season: int, episode: int) -> Optional[Dict]:
-        """
-        Get information about a specific episode.
-        Returns episode information including name if found, None otherwise.
-        """
-        try:
-            url = f"{self.BASE_URL}/tv/{show_id}/season/{season}/episode/{episode}"
-            response = self.session.get(url, params={'api_key': self.api_key})
-            response.raise_for_status()
-            
-            episode_details = response.json()
-            return {
-                'name': episode_details['name'],
-                'overview': episode_details.get('overview', ''),
-                'air_date': episode_details.get('air_date', ''),
-                'episode_number': episode_details['episode_number'],
-                'season_number': episode_details['season_number']
-            }
-        except Exception as e:
-            # Error handled silently - errors are shown via rich display at higher levels
-            return None
-
     def get_season_episode_count(self, show_id: int, season: int) -> Optional[int]:
         """Get the total number of episodes in a season."""
         try:
@@ -116,43 +94,6 @@ class TMDBClient:
             # Error handled silently - errors are shown via rich display at higher levels
             return []
 
-    def verify_show_and_season(self, show_name: str, season: int) -> tuple[Optional[int], Optional[int]]:
-        """
-        Verify show exists and get show_id and episode count.
-        Returns tuple of (show_id, episode_count) or (None, None) if not found.
-        """
-        shows = self.search_tv_show(show_name)
-        if not shows:
-            return None, None
-        
-        # Use the first match for now
-        show_id = shows[0]['id']
-        episode_count = self.get_season_episode_count(show_id, season)
-        
-        return show_id, episode_count
-    
-    def get_episode_titles(self, show_name: str, season: int) -> List[str]:
-        """
-        Get all episode titles for a show and season.
-        Returns list of episode titles in order.
-        """
-        shows = self.search_tv_show(show_name)
-        if not shows:
-            return []
-        
-        # Use the first match
-        show_id = shows[0]['id']
-        season_data = self.get_season(show_id, season)
-        
-        if not season_data:
-            return []
-        
-        episodes = season_data.get('episodes', [])
-        # Sort by episode number to ensure correct order
-        episodes.sort(key=lambda x: x.get('episode_number', 0))
-        
-        return [ep.get('name', '') for ep in episodes if ep.get('name')]
-    
     def get_episode_info(self, show_name: str, season: int) -> List[Tuple[int, str]]:
         """
         Get all episode information for a show and season.
