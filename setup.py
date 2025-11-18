@@ -13,7 +13,7 @@ setup(
     description="OCR Name Matcher - Extract episode titles from video files using OCR",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="Your Name",
+    author="Eleftherios Amperiadis",
     packages=find_packages(),
     python_requires=">=3.9",
     install_requires=[

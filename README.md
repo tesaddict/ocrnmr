@@ -29,7 +29,7 @@ ocrnmr --show "The Office" --season 1 --input ~/videos/ --dry-run
 
 - `--show`: TV show name (e.g., "Star Trek: The Next Generation")
 - `--season`: Season number (e.g., 1)
-- `--input`: Input directory path containing video files
+- `--input`: Input directory path containing video files (currently processes `.mkv` files only)
 
 ### Optional Arguments
 
@@ -85,9 +85,9 @@ The episodes file (`--episodes-file`) is **optional** and only needed when TMDB 
 
 ## How It Works
 
-1. **Frame Extraction**: Uses FFMPEG to extract frames from video files at specified intervals
+1. **Frame Extraction**: Uses FFmpeg to extract frames from video files at specified intervals
 2. **OCR Processing**: Uses EasyOCR to extract text from frames
-3. **Episode Matching**: Matches extracted text against episode titles (from TMDB or config) using fuzzy matching
+3. **Episode Matching**: Matches extracted text against episode titles (from TMDB or episodes file) using fuzzy matching
 4. **Rename Preview**: Shows preview of all matches before renaming
 5. **File Renaming**: Automatically renames files with format: `Show Name - S01E01 - Episode Title.mkv`
 
@@ -97,7 +97,7 @@ The episodes file (`--episodes-file`) is **optional** and only needed when TMDB 
 - **TMDB integration**: Automatically fetches episode titles from TMDB
 - **Custom episodes**: Support for manual episode lists when TMDB is incomplete
 - **Pipelined processing**: Extracts frames in background while OCR processes current file
-- **Interactive display**: Real-time progress display with split panes for OCR and FFMPEG status
+- **Interactive display**: Real-time progress display with split panes for OCR and FFmpeg status
 - **Rename preview**: Always shows preview before applying changes
 - **Hardware acceleration**: Supports VideoToolbox (macOS), VAAPI (Linux), D3D11VA/DXVA2 (Windows)
 - **Dry-run mode**: Preview changes without renaming files
@@ -111,18 +111,23 @@ ocrnmr/
 │   ├── __main__.py      # Entry point
 │   ├── cli.py           # CLI interface
 │   ├── display.py       # Display module
-│   ├── episode_matcher.py
-│   ├── exit_flag.py
+│   ├── episode_fetcher.py  # TMDB and episode file fetching
+│   ├── episode_matcher.py  # Fuzzy episode matching
+│   ├── exit_flag.py     # Interrupt handling
 │   ├── filename.py      # Filename utilities
-│   ├── frame_extractor.py
-│   ├── ocr_engine.py
-│   ├── processor.py
-│   ├── title_card_scanner.py
-│   └── tmdb_client.py  # TMDB API client
+│   ├── frame_extractor.py  # FFmpeg frame extraction
+│   ├── ocr_engine.py     # EasyOCR integration
+│   ├── processor.py     # Pipelined OCR processing
+│   ├── rename_executor.py  # Rename preview and execution
+│   ├── title_card_scanner.py  # Title card detection
+│   ├── tmdb_client.py   # TMDB API client
+│   └── video_processor.py  # Video processing orchestration
+├── LICENSE              # GPLv3 license
+├── setup.py             # Package setup
 ├── test_ocr_single.py   # Test script
 └── README.md
 ```
 
 ## License
 
-Same as parent renamer project.
+This project is licensed under the GNU General Public License v3 (GPLv3). See the [LICENSE](LICENSE) file for details.
