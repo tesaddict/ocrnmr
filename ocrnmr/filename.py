@@ -1,6 +1,7 @@
 """Filename generation utilities."""
 
 import re
+import unicodedata
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -16,8 +17,6 @@ def sanitize_filename(name: str) -> str:
     - Leading/trailing spaces and dots (Windows doesn't allow these)
     - Very long filenames (truncate to 255 chars, leaving room for extension)
     """
-    import unicodedata
-    
     # Characters to replace with space or dash
     # Path separators and Windows reserved characters
     unsafe_replace = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
@@ -48,7 +47,6 @@ def sanitize_filename(name: str) -> str:
     # Collapse repeated spaces and dashes
     name = ' '.join(name.split())
     # Clean up multiple dashes/spaces combinations
-    import re
     name = re.sub(r'\s*-\s*-\s*', ' - ', name)  # Multiple dashes
     name = re.sub(r'\s{2,}', ' ', name)  # Multiple spaces
     
@@ -70,38 +68,3 @@ def sanitize_filename(name: str) -> str:
     name = name.rstrip(' .')
     
     return name
-
-
-def parse_episode_number(filename: str) -> Optional[Tuple[int, int]]:
-    """
-    Parse season and episode number from a filename.
-    
-    Supports formats like:
-    - S03E01, S3E1, s03e01, s3e1
-    - S03x01, S3x1, s03x01, s3x1
-    - 03x01, 3x1
-    - Season 3 Episode 1, Season 3 Ep 1
-    
-    Returns:
-        Tuple of (season, episode) if found, else None
-    """
-    # Try common patterns: S03E01, S3E1, s03e01, etc.
-    patterns = [
-        r'[Ss](\d+)[Ee](\d+)',           # S03E01, S3E1
-        r'[Ss](\d+)[Xx](\d+)',           # S03x01, S3x1
-        r'(\d+)[Xx](\d+)',                # 03x01, 3x1 (assume season/episode)
-        r'[Ss]eason\s+(\d+).*[Ee]pisode\s+(\d+)',  # Season 3 Episode 1
-        r'[Ss]eason\s+(\d+).*[Ee]p\s+(\d+)',       # Season 3 Ep 1
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, filename, re.IGNORECASE)
-        if match:
-            try:
-                season = int(match.group(1))
-                episode = int(match.group(2))
-                return (season, episode)
-            except (ValueError, IndexError):
-                continue
-    
-    return None

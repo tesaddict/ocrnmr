@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """Command-line interface for OCR NMR application."""
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path for direct script execution
-# This allows the script to be run as: python3 ocrnmr/cli.py
-script_dir = Path(__file__).parent.parent
-if str(script_dir) not in sys.path:
-    sys.path.insert(0, str(script_dir))
-
 import argparse
 import json
 import logging
@@ -22,23 +13,37 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Import display module
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from ocrnmr_display import OCRProgressDisplay
+try:
+    import requests
+except ImportError:
+    requests = None
 
-from ocrnmr.ocr import PipelinedOCRProcessor
+# Add parent directory to path for direct script execution
+# This allows the script to be run as: python3 ocrnmr/cli.py
+script_dir = Path(__file__).parent.parent
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
+
+# All imports at the top - simpler and more reliable
+from ocrnmr.display import OCRProgressDisplay
+from ocrnmr.processor import PipelinedOCRProcessor
 from ocrnmr.tmdb_client import TMDBClient
 from ocrnmr.filename import sanitize_filename
 from ocrnmr.exit_flag import FORCE_EXIT
 
+# Rich imports for help formatting and preview display
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+
 logger = logging.getLogger(__name__)
 
-# Suppress logging output when using prompt_toolkit display
+# Suppress logging output when using rich display
 # Logging messages interfere with the display, so we suppress them
 # and route important messages through the display system instead
 # Suppress specific loggers that might output during processing
 def _suppress_logging():
-    """Suppress logging output that interferes with prompt_toolkit."""
+    """Suppress logging output that interferes with rich display."""
     null_handler = logging.NullHandler()
     for logger_name in ['ocrnmr.ocr.processor', 'ocrnmr.ocr', 'ocrnmr']:
         logger = logging.getLogger(logger_name)
@@ -46,14 +51,98 @@ def _suppress_logging():
         logger.handlers = [null_handler]  # Replace all handlers
         logger.propagate = False  # Prevent propagation to root logger
 
-# Call immediately to suppress logging before any modules are imported
-_suppress_logging()
+
+class RichHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Custom help formatter using rich for beautiful output."""
+    
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=50, width=120)
+        self.console = Console()
+    
+    def _format_action_invocation(self, action):
+        """Format the action invocation (argument name) with rich colors."""
+        try:
+            if not action.option_strings:
+                metavar, = self._metavar_formatter(action, action.dest)(1)
+                return f"[yellow]{metavar}[/yellow]"
+            else:
+                parts = []
+                # Format option strings with cyan color
+                for option_string in action.option_strings:
+                    parts.append(f"[cyan]{option_string}[/cyan]")
+                # Add metavar if present
+                if hasattr(action, 'metavar') and action.metavar is not None:
+                    parts.append(f"[yellow]{action.metavar}[/yellow]")
+                return ' '.join(parts)
+        except Exception:
+            # Fallback to parent implementation if anything goes wrong
+            return super()._format_action_invocation(action)
+    
+    def _format_action(self, action):
+        """Format a single action with rich markup."""
+        try:
+            # Get the formatted help text
+            help_text = self._expand_help(action) if action.help else ""
+            
+            # Format the action invocation
+            action_header = self._format_action_invocation(action)
+            
+            # Mark required arguments
+            if hasattr(action, 'required') and action.required:
+                action_header = f"[bold]{action_header}[/bold] [red](required)[/red]"
+            
+            # Format help text - highlight defaults
+            if help_text:
+                # Replace default mentions with styled version
+                import re
+                help_text = re.sub(r'\(default:\s*([^)]+)\)', r'[dim](default: \1)[/dim]', help_text)
+                return f"  {action_header}\n      {help_text}\n"
+            else:
+                return f"  {action_header}\n"
+        except Exception:
+            # Fallback to parent implementation if anything goes wrong
+            return super()._format_action(action)
+    
+    def format_help(self):
+        """Format the entire help message with rich markup."""
+        try:
+            # Get the base formatted help from parent (this includes our rich markup from _format_action)
+            help_text = super().format_help()
+            
+            # Apply additional rich formatting to sections
+            lines = help_text.split('\n')
+            formatted_lines = []
+            
+            for line in lines:
+                # Format usage line
+                if line.strip().startswith('usage:'):
+                    formatted_lines.append(f"[bold cyan]{line.strip()}[/bold cyan]")
+                # Format section headers (lines that are all caps or have colons and aren't indented)
+                elif line and not line.startswith(' ') and (line.isupper() or (':' in line and len(line.strip()) < 50)):
+                    formatted_lines.append(f"[bold]{line}[/bold]")
+                # Format epilog examples (comment lines)
+                elif line.strip().startswith('#'):
+                    formatted_lines.append(f"  [dim]{line.strip()}[/dim]")
+                # Format JSON in epilog
+                elif line.strip().startswith('{') or line.strip().startswith('}'):
+                    formatted_lines.append(f"  [yellow]{line.strip()}[/yellow]")
+                # Format command examples (lines with ocrnmr that aren't indented much)
+                elif line.strip() and 'ocrnmr' in line and line.startswith('  '):
+                    formatted_lines.append(f"  [green]{line.strip()}[/green]")
+                else:
+                    formatted_lines.append(line)
+            
+            return '\n'.join(formatted_lines)
+        except Exception:
+            # Fallback to parent implementation if anything goes wrong
+            return super().format_help()
 
 
 def load_config(config_path: Path) -> Dict:
     """Load configuration from JSON file."""
+    console = Console(stderr=True)
     if not config_path.exists():
-        print(f"Error: Config file not found: {config_path}")
+        console.print(f"[red]Error:[/red] Config file not found: {config_path}")
         sys.exit(1)
     
     try:
@@ -61,10 +150,10 @@ def load_config(config_path: Path) -> Dict:
             config = json.load(f)
         return config
     except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in config file: {e}")
+        console.print(f"[red]Error:[/red] Invalid JSON in config file: {e}")
         sys.exit(1)
     except Exception as e:
-        print(f"Error loading config file: {e}")
+        console.print(f"[red]Error loading config file:[/red] {e}")
         sys.exit(1)
 
 
@@ -76,7 +165,34 @@ def get_episode_titles(config: Dict, display: Optional[OCRProgressDisplay] = Non
     show_name = show_config.get("show_name")
     season = show_config.get("season")
     tmdb_api_key = show_config.get("tmdb_api_key")
-    manual_titles = show_config.get("episode_titles", [])
+    
+    # Support new format: episodes array with explicit episode numbers
+    episodes = show_config.get("episodes", [])
+    # Support old format: flat episode_titles list (backward compatibility)
+    episode_titles_old = show_config.get("episode_titles", [])
+    
+    # Extract titles from new episodes format
+    manual_titles = []
+    if episodes:
+        # New format: episodes array
+        for ep_entry in episodes:
+            if isinstance(ep_entry, dict) and "title" in ep_entry:
+                manual_titles.append(ep_entry["title"])
+            elif isinstance(ep_entry, str):
+                # Handle case where episodes might be a list of strings (fallback)
+                manual_titles.append(ep_entry)
+    elif episode_titles_old:
+        # Old format: flat list (backward compatibility)
+        manual_titles = episode_titles_old
+    
+    # Track TMDB lookup status for better error messages
+    tmdb_status = {
+        'api_key_provided': False,
+        'api_key_valid': None,  # None = not checked, True = valid, False = invalid
+        'show_found': None,
+        'season_found': None,
+        'error_message': None
+    }
     
     # Try to fetch from TMDB if show_name and season are provided
     if show_name and season:
@@ -84,25 +200,77 @@ def get_episode_titles(config: Dict, display: Optional[OCRProgressDisplay] = Non
             # Get API key from config or environment
             api_key = tmdb_api_key
             if not api_key:
-                import os
                 api_key = os.getenv('TMDB_API_KEY')
             
             if api_key:
+                tmdb_status['api_key_provided'] = True
                 if display:
                     display.add_ocr_diagnostic(f"Fetching episode titles from TMDB for {show_name} Season {season}...")
-                client = TMDBClient(api_key=api_key)
-                tmdb_titles = client.get_episode_titles(show_name, season)
-                if tmdb_titles:
-                    episode_titles.extend(tmdb_titles)
+                
+                try:
+                    client = TMDBClient(api_key=api_key)
+                    tmdb_titles = client.get_episode_titles(show_name, season)
+                    
+                    if tmdb_titles:
+                        episode_titles.extend(tmdb_titles)
+                        tmdb_status['api_key_valid'] = True
+                        tmdb_status['show_found'] = True
+                        tmdb_status['season_found'] = True
+                        if display:
+                            display.add_ocr_diagnostic(f"Found {len(tmdb_titles)} episodes from TMDB")
+                    else:
+                        # Check if show was found but season wasn't, or if show wasn't found
+                        # This helps diagnose the issue
+                        try:
+                            shows = client.search_tv_show(show_name)
+                            if shows:
+                                tmdb_status['api_key_valid'] = True
+                                tmdb_status['show_found'] = True
+                                show_id = shows[0]['id']
+                                season_data = client.get_season(show_id, season)
+                                if season_data:
+                                    tmdb_status['season_found'] = True
+                                    tmdb_status['error_message'] = f"Season {season} found but has no episodes"
+                                else:
+                                    tmdb_status['season_found'] = False
+                                    tmdb_status['error_message'] = f"Season {season} not found for this show"
+                            else:
+                                tmdb_status['api_key_valid'] = True
+                                tmdb_status['show_found'] = False
+                                tmdb_status['error_message'] = f"Show '{show_name}' not found in TMDB"
+                        except Exception as diag_e:
+                            # If diagnostic check fails, assume API is valid but couldn't diagnose
+                            # Don't mark API as invalid just because diagnostics failed
+                            tmdb_status['api_key_valid'] = True
+                            tmdb_status['error_message'] = f"No episodes found (diagnostic check failed: {diag_e})"
+                        
+                        if display:
+                            display.add_ocr_diagnostic("No episodes found in TMDB")
+                except requests.exceptions.HTTPError as e:
+                    # Only mark API as invalid for actual HTTP errors
+                    if hasattr(e, 'response') and e.response.status_code == 401:
+                        tmdb_status['api_key_valid'] = False
+                        tmdb_status['error_message'] = "Invalid TMDB API key (401 Unauthorized)"
+                        if display:
+                            display.add_ocr_diagnostic("Error: Invalid TMDB API key")
+                    else:
+                        tmdb_status['api_key_valid'] = None  # Unknown - could be network issue
+                        tmdb_status['error_message'] = f"TMDB API HTTP error: {e} (status {getattr(e.response, 'status_code', 'unknown')})"
+                        if display:
+                            display.add_ocr_diagnostic(f"Error fetching from TMDB: {e}")
+                except Exception as e:
+                    # For other exceptions, don't assume API is invalid
+                    # It could be network issues, timeouts, etc.
+                    tmdb_status['api_key_valid'] = None  # Unknown
+                    tmdb_status['error_message'] = f"Error accessing TMDB: {e}"
                     if display:
-                        display.add_ocr_diagnostic(f"Found {len(tmdb_titles)} episodes from TMDB")
-                else:
-                    if display:
-                        display.add_ocr_diagnostic("No episodes found in TMDB")
+                        display.add_ocr_diagnostic(f"Error fetching from TMDB: {e}")
+                        display.add_ocr_diagnostic("Continuing with manual episode titles only...")
             else:
                 if display:
                     display.add_ocr_diagnostic("TMDB API key not provided, skipping TMDB lookup")
         except Exception as e:
+            tmdb_status['error_message'] = f"Unexpected error: {e}"
             if display:
                 display.add_ocr_diagnostic(f"Error fetching from TMDB: {e}")
                 display.add_ocr_diagnostic("Continuing with manual episode titles only...")
@@ -114,9 +282,70 @@ def get_episode_titles(config: Dict, display: Optional[OCRProgressDisplay] = Non
             display.add_ocr_diagnostic(f"Added {len(manual_titles)} manual episode titles")
     
     if not episode_titles:
+        # Build detailed error message based on what we know
+        error_parts = [
+            "\n",
+            "ERROR: No episode titles found.\n",
+            "\n",
+            f"Show: {show_config.get('show_name', 'N/A')}\n",
+            f"Season: {show_config.get('season', 'N/A')}\n",
+            "\n"
+        ]
+        
+        # Add TMDB-specific diagnostics
+        if tmdb_status['api_key_provided']:
+            if tmdb_status['api_key_valid'] is False:
+                error_parts.append("TMDB API Issue: Invalid API key detected (401 Unauthorized).\n")
+                error_parts.append("  → Check your API key: --tmdb-key YOUR_KEY\n")
+                error_parts.append("  → Get a key from: https://www.themoviedb.org/settings/api\n")
+            elif tmdb_status['api_key_valid'] is None:
+                # API key validity unknown (could be network issue, etc.)
+                if tmdb_status['error_message']:
+                    error_parts.append(f"TMDB API Issue: {tmdb_status['error_message']}\n")
+                else:
+                    error_parts.append("TMDB API Issue: Unable to verify API key (may be network issue).\n")
+            elif tmdb_status['show_found'] is False:
+                error_parts.append("TMDB Issue: Show not found.\n")
+                error_parts.append(f"  → '{show_config.get('show_name')}' was not found in TMDB\n")
+                error_parts.append("  → Try a different show name or use --episodes-file\n")
+            elif tmdb_status['season_found'] is False:
+                error_parts.append("TMDB Issue: Season not found.\n")
+                error_parts.append(f"  → Season {show_config.get('season')} not found for this show\n")
+                error_parts.append("  → Verify the season number or use --episodes-file\n")
+            elif tmdb_status['error_message']:
+                error_parts.append(f"TMDB Issue: {tmdb_status['error_message']}\n")
+            else:
+                error_parts.append("TMDB Issue: No episodes found.\n")
+        else:
+            error_parts.append("TMDB API key not provided.\n")
+        
+        error_parts.extend([
+            "\n",
+            "Solutions:\n",
+            "  1. Provide a TMDB API key:\n",
+            "     --tmdb-key YOUR_API_KEY\n",
+            "     (or set TMDB_API_KEY environment variable)\n",
+            "     Get a key from: https://www.themoviedb.org/settings/api\n",
+            "\n",
+            "  2. Provide an episodes file:\n",
+            "     --episodes-file path/to/episodes.json\n",
+            "\n"
+        ])
+        
+        error_msg = ''.join(error_parts)
+        
         if display:
-            display.add_ocr_diagnostic("Error: No episode titles found")
-        print("Error: No episode titles found. Please provide show_name/season for TMDB or manual episode_titles in config.")
+            # Show error prominently in the display
+            display.show_error(error_msg)
+            # Add to diagnostics as well
+            display.add_ocr_diagnostic("ERROR: No episode titles found")
+            # Give display time to show the error (5 seconds so user can read it)
+            time.sleep(5.0)
+        else:
+            # If no display, use rich console for error output
+            console = Console(stderr=True)
+            console.print(f"[red]{error_msg}[/red]")
+        
         sys.exit(1)
     
     return episode_titles
@@ -124,7 +353,7 @@ def get_episode_titles(config: Dict, display: Optional[OCRProgressDisplay] = Non
 
 def get_episode_info(config: Dict, display: Optional[OCRProgressDisplay] = None) -> Dict[str, Tuple[int, int]]:
     """
-    Get episode information (season, episode number) from TMDB.
+    Get episode information (season, episode number) from TMDB and/or config.
     Returns a dict mapping episode_title -> (season, episode_number).
     """
     show_config = config.get("show", {})
@@ -133,7 +362,11 @@ def get_episode_info(config: Dict, display: Optional[OCRProgressDisplay] = None)
     show_name = show_config.get("show_name")
     season = show_config.get("season")
     tmdb_api_key = show_config.get("tmdb_api_key")
-    manual_titles = show_config.get("episode_titles", [])
+    
+    # Support new format: episodes array with explicit episode numbers
+    episodes = show_config.get("episodes", [])
+    # Support old format: flat episode_titles list (backward compatibility)
+    episode_titles_old = show_config.get("episode_titles", [])
     
     # Try to fetch from TMDB if show_name and season are provided
     if show_name and season:
@@ -141,7 +374,6 @@ def get_episode_info(config: Dict, display: Optional[OCRProgressDisplay] = None)
             # Get API key from config or environment
             api_key = tmdb_api_key
             if not api_key:
-                import os
                 api_key = os.getenv('TMDB_API_KEY')
             
             if api_key:
@@ -159,11 +391,31 @@ def get_episode_info(config: Dict, display: Optional[OCRProgressDisplay] = None)
             if display:
                 display.add_ocr_diagnostic(f"Error fetching episode info from TMDB: {e}")
     
-    # For manual titles, assign sequential episode numbers starting from 1
-    # Only assign if not already in episode_info (TMDB takes precedence)
-    for idx, title in enumerate(manual_titles, start=1):
-        if title not in episode_info:
-            episode_info[title] = (season, idx)
+    # Process manual episodes from config
+    if episodes:
+        # New format: episodes array with explicit episode numbers
+        for ep_entry in episodes:
+            if isinstance(ep_entry, dict):
+                ep_num = ep_entry.get("episode")
+                ep_title = ep_entry.get("title")
+                if ep_num is not None and ep_title:
+                    # Use explicit episode number from config
+                    # TMDB takes precedence if title already exists
+                    if ep_title not in episode_info:
+                        episode_info[ep_title] = (season, ep_num)
+            elif isinstance(ep_entry, str):
+                # Fallback: treat as title with sequential numbering
+                # Only if not already in episode_info (TMDB takes precedence)
+                if ep_entry not in episode_info:
+                    # Use index in episodes array + 1 as episode number
+                    ep_num = episodes.index(ep_entry) + 1
+                    episode_info[ep_entry] = (season, ep_num)
+    elif episode_titles_old:
+        # Old format: flat list - assign sequential episode numbers starting from 1
+        # Only assign if not already in episode_info (TMDB takes precedence)
+        for idx, title in enumerate(episode_titles_old, start=1):
+            if title not in episode_info:
+                episode_info[title] = (season, idx)
     
     return episode_info
 
@@ -340,7 +592,6 @@ def process_video_files(
         return not display.early_exit_requested
     
     # Mark OCR start time
-    import time
     display.ocr_start_time = time.time()
     
     # Process files using pipelined processor
@@ -421,10 +672,6 @@ def generate_rename_preview(
 def display_rename_preview(rename_preview: List[Tuple[str, Optional[str], Optional[str]]], 
                           display: OCRProgressDisplay, show_name: str, season: int):
     """Display rename preview using rich console formatting."""
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    
     console = Console()
     matched_count = sum(1 for _, new_name, _ in rename_preview if new_name)
     total_count = len(rename_preview)
@@ -433,7 +680,6 @@ def display_rename_preview(rename_preview: List[Tuple[str, Optional[str], Option
     display.stop()
     
     # Wait a moment for the display thread to fully stop
-    import time
     time.sleep(0.2)
     
     # Clear screen and print preview
@@ -465,6 +711,7 @@ def display_rename_preview(rename_preview: List[Tuple[str, Optional[str], Option
 
 def execute_renames(rename_preview: List[Tuple[str, Optional[str], Optional[str]]], input_directory: Path):
     """Execute file renames."""
+    console = Console()
     renamed_count = 0
     for original, new_name, _ in rename_preview:
         if new_name:
@@ -477,24 +724,22 @@ def execute_renames(rename_preview: List[Tuple[str, Optional[str], Optional[str]
             
             # Check if target already exists
             if new_path.exists():
-                print(f"⚠ Skipping {original}: target already exists")
+                console.print(f"[yellow]⚠[/yellow] Skipping {original}: target already exists")
                 continue
             
             try:
                 original_path.rename(new_path)
                 renamed_count += 1
             except Exception as e:
-                print(f"Error renaming {original}: {e}")
+                console.print(f"[red]Error renaming {original}:[/red] {e}")
     
-    print(f"\n✓ Renamed {renamed_count} files")
+    console.print(f"\n[green]✓[/green] Renamed {renamed_count} files")
 
 
 def _restore_terminal():
     """Restore terminal to normal mode before exiting."""
     try:
-        import sys
         # Try to reset terminal using stty command (most reliable)
-        import subprocess
         subprocess.run(['stty', 'sane'], timeout=0.1, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     except Exception:
         # If stty fails, try termios
@@ -540,14 +785,91 @@ def main():
     # Register aggressive SIGINT handler for immediate exit
     signal.signal(signal.SIGINT, _aggressive_sigint_handler)
     
+    # Use standard formatter by default, only use rich formatter for help
     parser = argparse.ArgumentParser(
-        description="OCR-based episode renaming tool for TV shows"
+        description="OCR-based episode renaming tool for TV shows",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage with TMDB (no config file needed):
+  ocrnmr --show "Star Trek: The Next Generation" --season 1 --input ~/videos/season1/
+
+  # With custom episodes (episodes file required):
+  ocrnmr --show "Dragon Ball Z Kai" --season 5 --input ~/videos/ --episodes-file episodes.json
+
+  # Override OCR settings:
+  ocrnmr --show "Stargate SG-1" --season 2 --input ~/videos/ --max-dimension 1200 --duration 900
+
+  # Dry run to preview changes:
+  ocrnmr --show "The Office" --season 1 --input ~/videos/ --dry-run
+
+Episodes File Format:
+  The episodes file (--episodes-file) is optional and only needed for custom episodes when TMDB
+  doesn't have complete information. It should contain:
+  
+  {
+    "episodes": [
+      {"episode": 1, "title": "Episode Title 1"},
+      {"episode": 1, "title": "Episode Title Variant"},
+      {"episode": 2, "title": "Episode Title 2"}
+    ]
+  }
+  
+  All other settings (OCR parameters, show info) come from CLI arguments.
+        """
     )
+    
+    # Override print_help to use rich formatting only when help is requested
+    def print_help(file=None):
+        # Create a rich formatter just for this help output
+        rich_formatter = RichHelpFormatter(parser.prog)
+        # Temporarily replace the formatter
+        original_formatter = parser._get_formatter()
+        parser._formatter = rich_formatter
+        try:
+            # Generate help text with rich markup
+            help_text = parser.format_help()
+            # Print using rich console (which understands the markup)
+            console = Console()
+            console.print(help_text)
+        finally:
+            # Restore original formatter
+            parser._formatter = original_formatter
+    
+    parser.print_help = print_help
+    
+    # Required arguments
     parser.add_argument(
-        "--config",
+        "--show",
         type=str,
         required=True,
-        help="Path to configuration JSON file"
+        help="TV show name (required)"
+    )
+    parser.add_argument(
+        "--season",
+        type=int,
+        required=True,
+        help="Season number (required)"
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        required=True,
+        help="Input directory path containing video files (required)"
+    )
+    
+    # Optional arguments
+    parser.add_argument(
+        "--episodes-file",
+        type=str,
+        default=None,
+        help="Path to JSON file containing custom episodes array (optional, only needed when TMDB doesn't have complete info)"
+    )
+    parser.add_argument(
+        "--tmdb-key",
+        type=str,
+        default=None,
+        help="TMDB API key (optional, can also use TMDB_API_KEY environment variable)"
     )
     parser.add_argument(
         "--dry-run",
@@ -555,38 +877,115 @@ def main():
         help="Preview renames without executing"
     )
     
+    # OCR settings (all optional with defaults)
+    parser.add_argument(
+        "--max-dimension",
+        type=int,
+        default=800,
+        help="Maximum frame dimension in pixels (default: 800, use 0 for full resolution)"
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=600,
+        help="Maximum duration to process in seconds (default: 600 = 10 minutes, use 0 for full video)"
+    )
+    parser.add_argument(
+        "--frame-interval",
+        type=float,
+        default=2.0,
+        help="Interval between frames in seconds (default: 2.0)"
+    )
+    parser.add_argument(
+        "--match-threshold",
+        type=float,
+        default=0.6,
+        help="Episode matching threshold 0.0-1.0 (default: 0.6, lower = more lenient)"
+    )
+    parser.add_argument(
+        "--hwaccel",
+        type=str,
+        default=None,
+        choices=['videotoolbox', 'vaapi', 'd3d11va', 'dxva2'],
+        help="Hardware acceleration: videotoolbox (macOS), vaapi (Linux), d3d11va/dxva2 (Windows). Default: None (software)"
+    )
+    
     args = parser.parse_args()
     
-    # Load config
-    config_path = Path(args.config).expanduser()
-    config = load_config(config_path)
+    # Suppress logging (modules already imported at top)
+    _suppress_logging()
+    
+    # Load episodes file if provided (only for custom episodes)
+    episodes = []
+    if args.episodes_file:
+        episodes_path = Path(args.episodes_file).expanduser()
+        if not episodes_path.exists():
+            console = Console(stderr=True)
+            console.print(f"[red]Error:[/red] Episodes file not found: {episodes_path}")
+            sys.exit(1)
+        episodes_config = load_config(episodes_path)
+        episodes = episodes_config.get("episodes", [])
+    
+    # Build show config from CLI arguments
+    show_config = {
+        "show_name": args.show,
+        "season": args.season,
+        "input_directory": args.input,
+    }
+    if args.tmdb_key:
+        show_config["tmdb_api_key"] = args.tmdb_key
+    if episodes:
+        show_config["episodes"] = episodes
+    
+    # Build OCR config from CLI arguments (CLI is the only source)
+    ocr_config = {
+        "max_dimension": args.max_dimension if args.max_dimension > 0 else None,
+        "duration": args.duration if args.duration > 0 else None,
+        "frame_interval": args.frame_interval,
+        "match_threshold": args.match_threshold,
+        "hwaccel": args.hwaccel,
+    }
+    
+    # Build config dict for use by helper functions
+    config = {"show": show_config}
     
     # Logging is already suppressed at module level above
-    # This ensures no logger output interferes with prompt_toolkit display
+    # This ensures no logger output interferes with rich display
     
-    # Initialize display
-    display = OCRProgressDisplay()
-    display.start()
+    # Initialize display with error handling
+    display = None
+    try:
+        display = OCRProgressDisplay()
+        display.start()
+    except Exception as e:
+        # Use rich console for error output
+        console = Console(stderr=True)
+        console.print(f"[red]ERROR:[/red] Failed to start display: {e}")
+        # Continue without display if it fails
+        console.print("[yellow]WARNING:[/yellow] Continuing without display")
     
     try:
         # Get episode titles
         episode_titles = get_episode_titles(config, display)
-        display.add_ocr_diagnostic(f"Total episode titles: {len(episode_titles)}")
+        if display:
+            display.add_ocr_diagnostic(f"Total episode titles: {len(episode_titles)}")
         
         # Get input directory
-        show_config = config.get("show", {})
-        input_directory = Path(show_config.get("input_directory", ".")).expanduser()
+        input_directory = Path(args.input).expanduser()
         if not input_directory.exists():
-            display.add_ocr_diagnostic(f"Error: Input directory not found: {input_directory}")
-            print(f"Error: Input directory not found: {input_directory}")
+            error_msg = f"Error: Input directory not found: {input_directory}"
+            if display:
+                display.show_error(error_msg)
+                display.add_ocr_diagnostic(error_msg)
+                time.sleep(2.0)
+            else:
+                console = Console(stderr=True)
+                console.print(f"[red]{error_msg}[/red]")
             sys.exit(1)
         
         # Get show name and season for filename generation
-        show_name = show_config.get("show_name", "Unknown Show")
-        season = show_config.get("season", 1)
-        
-        # Process video files
-        ocr_config = config.get("ocr", {})
+        show_name = args.show
+        season = args.season
         early_exit = False
         processor = None  # Initialize to None so it's in scope for exception handler
         try:
@@ -595,8 +994,8 @@ def main():
             
             matches = process_video_files(input_directory, episode_titles, ocr_config, display, args.dry_run, processor_ref=None, episode_info=episode_info, show_name=show_name)
             # Check if early exit was requested
-            early_exit = display.early_exit_requested
-            if early_exit:
+            early_exit = display.early_exit_requested if display else False
+            if early_exit and display:
                 display.add_ocr_diagnostic("Early exit requested - showing preview with current matches")
         except KeyboardInterrupt:
             # Force exit immediately - signal handler should have already killed everything
@@ -626,10 +1025,12 @@ def main():
             _restore_terminal()
             os._exit(130)
         # Clean up display
-        try:
-            display.stop()
-        except Exception:
-            pass
+        if display:
+            try:
+                display.stop()
+            except Exception as e:
+                # Silently ignore errors when stopping display
+                pass
     
     return 0
 

@@ -2,8 +2,9 @@
 
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Iterator, Tuple, Optional, List
+from typing import Tuple, Optional, List
 
 try:
     import ffmpeg
@@ -14,7 +15,7 @@ except ImportError:
 _active_processes = []
 
 
-# Don't register a global signal handler - it interferes with prompt_toolkit
+# Don't register a global signal handler - it interferes with rich display
 # Signal handling is done at the application level instead
 # The FrameCache.shutdown() method will kill FFMPEG processes when needed
 
@@ -67,141 +68,6 @@ def _parse_mjpeg_frames_from_buffer(
         i += 1
     
     return buffer, in_frame, frame_start
-
-
-def extract_frames(
-    media_file: Path,
-    interval_seconds: float = 1.0,
-    save_frames: bool = False,
-    output_dir: Optional[Path] = None,
-    max_dimension: Optional[int] = None
-) -> Iterator[Tuple[float, bytes]]:
-    """
-    Extract frames from a video file at specified intervals.
-    
-    This is a generator that yields frames one at a time to minimize memory usage.
-    Each frame is extracted as JPEG bytes (or PNG if save_frames=True).
-    
-    Args:
-        media_file: Path to the video file
-        interval_seconds: Interval between frames in seconds (default: 1.0)
-        save_frames: If True, save frames as PNG files to output_dir (default: False)
-        output_dir: Directory to save frames to if save_frames is True (default: media_file parent / frames)
-        max_dimension: Maximum width or height in pixels. If set, frames are scaled by ffmpeg before extraction.
-                      This is faster and uses less memory than extracting full-resolution frames.
-                      If None, frames are extracted at full resolution (default: None)
-    
-    Yields:
-        Tuple of (timestamp, frame_bytes) where timestamp is in seconds
-    
-    Raises:
-        RuntimeError: If ffmpeg is not available or video cannot be processed
-    """
-    if ffmpeg is None:
-        raise RuntimeError("ffmpeg-python is not installed. Please install it with: pip install ffmpeg-python")
-    
-    if not media_file.exists():
-        raise FileNotFoundError(f"Media file not found: {media_file}")
-    
-    # Set up output directory for saving frames
-    if save_frames:
-        if output_dir is None:
-            output_dir = media_file.parent / f"{media_file.stem}_frames"
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-    
-    try:
-        # Probe the video to get duration
-        probe = ffmpeg.probe(str(media_file))
-        video_stream = next(
-            (stream for stream in probe['streams'] if stream['codec_type'] == 'video'),
-            None
-        )
-        
-        if video_stream is None:
-            raise RuntimeError(f"No video stream found in {media_file}")
-        
-        duration = float(probe['format'].get('duration', 0))
-        if duration <= 0:
-            raise RuntimeError(f"Invalid video duration: {duration}")
-        
-        # Extract frames at specified intervals
-        current_time = 0.0
-        
-        while current_time < duration:
-            try:
-                # Extract a single frame at current_time
-                # Use run_async to get process handle for cleanup
-                # Use PNG format if saving frames, otherwise JPEG for smaller size
-                output_format = 'png' if save_frames else 'image2'
-                output_codec = 'png' if save_frames else 'mjpeg'
-                
-                # Build ffmpeg pipeline
-                input_stream = ffmpeg.input(str(media_file), ss=current_time)
-                
-                # Apply scaling if requested (faster and smaller than extracting full resolution)
-                if max_dimension is not None:
-                    # Scale to max_dimension while maintaining aspect ratio
-                    # Use -1 to let ffmpeg calculate height automatically
-                    input_stream = input_stream.filter('scale', max_dimension, -1)
-                
-                process = (
-                    input_stream
-                    .output('pipe:', vframes=1, format=output_format, vcodec=output_codec)
-                    .run_async(pipe_stdout=True, pipe_stderr=True, quiet=True)
-                )
-                
-                # Track process for cleanup
-                _active_processes.append(process)
-                
-                try:
-                    out, _ = process.communicate(timeout=10)
-                    
-                    # Remove from tracking after completion
-                    if process in _active_processes:
-                        _active_processes.remove(process)
-                    
-                    if out:
-                        # Save frame as PNG if requested
-                        if save_frames:
-                            frame_filename = output_dir / f"frame_{current_time:06.1f}s.png"
-                            with open(frame_filename, 'wb') as f:
-                                f.write(out)
-                        
-                        yield (current_time, out)
-                    
-                    current_time += interval_seconds
-                    
-                except subprocess.TimeoutExpired:
-                    # Process timed out, kill it
-                    process.kill()
-                    process.wait()
-                    if process in _active_processes:
-                        _active_processes.remove(process)
-                    current_time += interval_seconds
-                    continue
-                except KeyboardInterrupt:
-                    # User interrupted, cleanup and re-raise
-                    process.kill()
-                    process.wait()
-                    if process in _active_processes:
-                        _active_processes.remove(process)
-                    raise
-                
-            except KeyboardInterrupt:
-                # Clean up and re-raise
-                raise
-            except ffmpeg.Error as e:
-                # Skip frames that can't be extracted (e.g., near end of file)
-                # Continue to next interval
-                current_time += interval_seconds
-                continue
-            except Exception as e:
-                # For other errors, stop iteration
-                break
-                
-    except Exception as e:
-        raise RuntimeError(f"Error extracting frames from {media_file}: {str(e)}")
 
 
 def extract_frames_batch(
@@ -311,8 +177,7 @@ def extract_frames_batch(
         }
         
         # Use PIPE for stderr to capture error messages
-        import subprocess as sp
-        stderr_handle = sp.PIPE
+        stderr_handle = subprocess.PIPE
         
         process = (
             filtered_stream
@@ -325,7 +190,6 @@ def extract_frames_batch(
         
         # Give FFMPEG a moment to start up and begin producing output
         # This helps avoid hanging on the first read if FFMPEG is slow to initialize
-        import time
         time.sleep(0.1)  # Small delay to let FFMPEG start
         
         try:
@@ -344,8 +208,6 @@ def extract_frames_batch(
             max_timeout = 300  # Maximum total timeout in seconds
             read_timeout = 1.0  # Timeout per read operation in seconds
             
-            # Import time for timeout tracking
-            import time
             start_time = time.time()
             
             # Parse MJPEG frames incrementally as data arrives
@@ -470,7 +332,7 @@ def extract_frames_batch(
             if process.returncode != 0 and process.returncode not in (255, -15, -2):
                 # Try to read stderr if available (software mode)
                 stderr_data = None
-                if stderr_handle == sp.PIPE and process.stderr:
+                if stderr_handle == subprocess.PIPE and process.stderr:
                     try:
                         stderr_data = process.stderr.read()
                     except Exception:

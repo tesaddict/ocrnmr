@@ -27,17 +27,16 @@ import argparse
 import json
 import logging
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
-from concurrent.futures import ThreadPoolExecutor, Future
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-from ocrnmr.ocr import find_episode_by_title_card
-from ocrnmr.ocr import extract_text_from_frame, match_episode, match_episode_with_scores
+from ocrnmr import find_episode_by_title_card
+from ocrnmr import extract_text_from_frame, match_episode, match_episode_with_scores
+from ocrnmr.processor import FrameCache
 from ocrnmr.cli import get_episode_titles
 
 console = Console()
@@ -117,192 +116,6 @@ def print_frame_stats(video_file: Path):
         console.print()
     except Exception as e:
         console.print(f"[yellow]  Could not calculate frame statistics: {e}[/yellow]\n")
-
-
-class FrameCache:
-    """Manages pipelined FFMPEG frame extraction with memory limits."""
-    
-    def __init__(self, memory_limit_bytes: int = 1073741824, file_paths: Optional[List[Path]] = None):  # 1GB default
-        self.memory_limit = memory_limit_bytes
-        self.cache: Dict[Path, Tuple[Future, int]] = {}  # {file_path: (future, memory_bytes)}
-        self.executor = ThreadPoolExecutor(max_workers=1)
-        self.lock = threading.Lock()
-        self.logger = logging.getLogger(__name__)
-        self.file_paths = file_paths  # List of all file paths in order (for index lookup)
-        self.logger.info(f"FrameCache initialized with {memory_limit_bytes / 1024 / 1024:.0f}MB memory limit")
-    
-    def estimate_memory(self, frames: List[Tuple[float, bytes]]) -> int:
-        """Estimate memory usage of frame list in bytes."""
-        if not frames:
-            return 0
-        # Sum of frame bytes + ~10% overhead for list/tuple overhead
-        base_memory = sum(len(frame_bytes) for _, frame_bytes in frames)
-        return int(base_memory * 1.1)
-    
-    def get_total_memory(self) -> int:
-        """Get total memory used by all cached frames."""
-        with self.lock:
-            return sum(memory_bytes for _, memory_bytes in self.cache.values())
-    
-    def start_extraction(self, file_path: Path, config: Dict[str, Any]) -> None:
-        """Start background frame extraction for a file."""
-        with self.lock:
-            if file_path in self.cache:
-                # Already extracting or cached
-                return
-            
-            # Check if we have room (we'll check again when extraction completes)
-            future = self.executor.submit(self._extract_frames, file_path, config)
-            # We don't know memory yet, so estimate conservatively
-            self.cache[file_path] = (future, 0)
-            self.logger.info(f"Started background FFMPEG extraction for {file_path.name}")
-            print(f"[INFO] Started background FFMPEG extraction for {file_path.name}", file=sys.stderr)
-    
-    def _extract_frames(self, file_path: Path, config: Dict[str, Any]) -> List[Tuple[float, bytes]]:
-        """Extract frames in background thread."""
-        from ocrnmr.ocr.frame_extractor import extract_frames_batch
-        import sys
-        import time
-        
-        start_time = time.time()
-        print(f"[INFO] Background extraction starting for {file_path.name}...", file=sys.stderr)
-        
-        try:
-            # Regular batch extraction
-            print(f"[INFO] Calling extract_frames_batch for {file_path.name}...", file=sys.stderr)
-            frames = extract_frames_batch(
-                file_path,
-                interval_seconds=config.get("frame_interval", 2.0),
-                max_dimension=config.get("max_dimension"),
-                duration=config.get("duration"),
-                hwaccel=config.get("hwaccel"),
-                start_time=config.get("start_time")
-            )
-            extraction_time = time.time() - start_time
-            print(f"[INFO] extract_frames_batch completed in {extraction_time:.2f}s for {file_path.name}", file=sys.stderr)
-            
-            # Update memory estimate
-            print(f"[INFO] Estimating memory for {file_path.name}...", file=sys.stderr)
-            memory_bytes = self.estimate_memory(frames)
-            print(f"[INFO] Memory estimated: {memory_bytes / 1024 / 1024:.1f}MB for {file_path.name}", file=sys.stderr)
-            
-            print(f"[INFO] Acquiring lock to update cache for {file_path.name}...", file=sys.stderr)
-            with self.lock:
-                print(f"[INFO] Lock acquired for {file_path.name}", file=sys.stderr)
-                if file_path in self.cache:
-                    self.cache[file_path] = (self.cache[file_path][0], memory_bytes)
-                    # Calculate total memory directly without calling get_total_memory() to avoid deadlock
-                    # (we're already holding the lock)
-                    total_memory = sum(mem_bytes for _, mem_bytes in self.cache.values())
-                    log_msg = (
-                        f"FFMPEG extraction completed for {file_path.name}: "
-                        f"{len(frames)} frames, ~{memory_bytes / 1024 / 1024:.1f}MB "
-                        f"(total cache: ~{total_memory / 1024 / 1024:.1f}MB)"
-                    )
-                    self.logger.info(log_msg)
-                    print(f"[INFO] {log_msg}", file=sys.stderr)
-                else:
-                    print(f"[WARNING] File {file_path.name} not in cache when updating memory!", file=sys.stderr)
-            
-            print(f"[INFO] Lock released for {file_path.name}", file=sys.stderr)
-            
-            total_time = time.time() - start_time
-            print(f"[INFO] Background extraction completed successfully for {file_path.name} in {total_time:.2f}s, returning {len(frames)} frames", file=sys.stderr)
-            return frames
-        except Exception as e:
-            elapsed = time.time() - start_time
-            error_msg = f"Background extraction failed for {file_path.name} after {elapsed:.2f}s: {e}"
-            self.logger.error(error_msg)
-            print(f"[ERROR] {error_msg}", file=sys.stderr)
-            import traceback
-            print(f"[ERROR] Traceback: {traceback.format_exc()}", file=sys.stderr)
-            with self.lock:
-                if file_path in self.cache:
-                    del self.cache[file_path]
-            raise
-    
-    def get_frames(self, file_path: Path) -> Optional[List[Tuple[float, bytes]]]:
-        """Get frames for a file, waiting if extraction is in progress."""
-        with self.lock:
-            if file_path not in self.cache:
-                return None
-            
-            future, memory_bytes = self.cache[file_path]
-        
-        # Check if extraction is already complete
-        if future.done():
-            # Extraction already complete, get result immediately
-            print(f"[INFO] Extraction already done for {file_path.name}, getting result...", file=sys.stderr)
-            try:
-                frames = future.result()
-                print(f"[INFO] Got {len(frames) if frames else 0} frames from completed extraction for {file_path.name}", file=sys.stderr)
-                return frames
-            except Exception as e:
-                error_msg = f"Error getting frames for {file_path.name}: {e}"
-                self.logger.error(error_msg)
-                print(f"[ERROR] {error_msg}", file=sys.stderr)
-                import traceback
-                print(f"[ERROR] Traceback: {traceback.format_exc()}", file=sys.stderr)
-                with self.lock:
-                    if file_path in self.cache:
-                        del self.cache[file_path]
-                return None
-        
-        # Extraction still in progress - wait for it
-        print(f"[INFO] Waiting for background FFMPEG extraction to complete for {file_path.name}...", file=sys.stderr)
-        
-        try:
-            print(f"[INFO] Calling future.result() for {file_path.name}...", file=sys.stderr)
-            frames = future.result()  # This will block until extraction completes
-            print(f"[INFO] future.result() returned for {file_path.name}, got {len(frames) if frames else 0} frames", file=sys.stderr)
-            
-            # Check memory limit after extraction completes
-            print(f"[INFO] Checking memory limit for {file_path.name}...", file=sys.stderr)
-            try:
-                total_memory = self.get_total_memory()
-                print(f"[INFO] Total memory: {total_memory / 1024 / 1024:.1f}MB", file=sys.stderr)
-                if total_memory > self.memory_limit:
-                    self.logger.warning(
-                        f"Memory limit exceeded: {total_memory / 1024 / 1024:.1f}MB > "
-                        f"{self.memory_limit / 1024 / 1024:.1f}MB. "
-                        f"Consider reducing duration or frame_interval."
-                    )
-            except Exception as e:
-                print(f"[WARNING] Error checking memory limit: {e}", file=sys.stderr)
-            
-            print(f"[INFO] Background extraction completed for {file_path.name}, got {len(frames)} frames, returning", file=sys.stderr)
-            return frames
-        except Exception as e:
-            self.logger.error(f"Error getting frames for {file_path}: {e}")
-            print(f"[ERROR] Background extraction failed for {file_path.name}: {e}", file=sys.stderr)
-            with self.lock:
-                if file_path in self.cache:
-                    del self.cache[file_path]
-            return None
-    
-    def clear(self, file_path: Path) -> None:
-        """Remove frames from cache after use."""
-        print(f"[INFO] clear() called for {file_path.name}", file=sys.stderr)
-        with self.lock:
-            print(f"[INFO] clear() acquired lock for {file_path.name}", file=sys.stderr)
-            if file_path in self.cache:
-                memory_bytes = self.cache[file_path][1]
-                del self.cache[file_path]
-                # Calculate total memory directly (we already hold the lock)
-                total_memory = sum(mem_bytes for _, mem_bytes in self.cache.values())
-                log_msg = (
-                    f"Cleared cache for {file_path.name} (~{memory_bytes / 1024 / 1024:.1f}MB). "
-                    f"Remaining cache: ~{total_memory / 1024 / 1024:.1f}MB"
-                )
-                self.logger.info(log_msg)
-                print(f"[INFO] {log_msg}", file=sys.stderr)
-            else:
-                print(f"[WARNING] File {file_path.name} not in cache when trying to clear", file=sys.stderr)
-        print(f"[INFO] clear() released lock for {file_path.name}", file=sys.stderr)
-    
-    def shutdown(self) -> None:
-        """Shutdown the executor."""
-        self.executor.shutdown(wait=True)
 
 
 def test_single_file(test_file_config: dict, test_index: int = 0, total_tests: int = 1):
@@ -411,7 +224,7 @@ def test_single_file(test_file_config: dict, test_index: int = 0, total_tests: i
         # If show_all_text is enabled, extract frames and show all OCR text
         if show_all_text:
             console.print("[bold cyan]Extracting frames and showing all OCR text...[/bold cyan]\n")
-            from ocrnmr.ocr.frame_extractor import extract_frames_batch
+            from ocrnmr.frame_extractor import extract_frames_batch
             
             frames = pre_extracted_frames
             if frames is None:
@@ -539,7 +352,7 @@ def test_single_file(test_file_config: dict, test_index: int = 0, total_tests: i
                 console.print("\n  [dim]Attempting to find why no match...[/dim]")
                 # Try extracting a few frames manually to see what OCR gets
                 try:
-                    from ocrnmr.ocr.frame_extractor import extract_frames_batch
+                    from ocrnmr.frame_extractor import extract_frames_batch
                     
                     console.print("  [dim]Extracting sample frames...[/dim]")
                     start_time = test_file_config.get("start_time")
@@ -780,7 +593,7 @@ Examples:
     file_paths_list = [Path(test_file_config.get("test_file", "")).expanduser() for test_file_config in test_files_config]
     
     # Create frame cache for pipelined extraction
-    frame_cache = FrameCache(memory_limit_bytes=1073741824, file_paths=file_paths_list)  # 1GB limit
+    frame_cache = FrameCache(memory_limit_bytes=1073741824)  # 1GB limit
     # Make frame_cache available to test_single_file via globals
     globals()['frame_cache'] = frame_cache
     
@@ -815,25 +628,18 @@ Examples:
             if file_frame_interval is not None:
                 file_extraction_config["frame_interval"] = file_frame_interval
             frame_cache.start_extraction(file_path, file_extraction_config)
-            print(f"[INFO] Queued FFMPEG extraction for file {file_idx + 1}/{len(test_files_config)}: {file_path.name}", file=sys.stderr)
     
     # Run all test files
     for idx, test_file_config in enumerate(test_files_config):
         test_file_path = Path(test_file_config.get("test_file", "")).expanduser()
         
         # Process current file (frames should already be ready or will wait)
-        print(f"[INFO] Calling test_single_file for {test_file_path.name}...", file=sys.stderr)
         success, matched_episode = test_single_file(test_file_config, test_index=idx, total_tests=total_tests)
-        print(f"[INFO] test_single_file completed for {test_file_path.name}, success={success}", file=sys.stderr)
         results.append(success)
         matches.append((test_file_path, matched_episode))
         
         # Clear frames from cache after processing
-        print(f"[INFO] Clearing cache for {test_file_path.name}...", file=sys.stderr)
-        frame_cache.clear(test_file_path)
-        print(f"[INFO] Cache cleared for {test_file_path.name}", file=sys.stderr)
-        print(f"[INFO] Completed processing file {idx + 1}/{len(test_files_config)}: {test_file_path.name}", file=sys.stderr)
-        print(f"[INFO] Moving to next file in loop...", file=sys.stderr)
+        frame_cache.cleanup(test_file_path)
     
     # Shutdown frame cache executor
     frame_cache.shutdown()

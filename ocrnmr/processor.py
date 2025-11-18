@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Any
 
-from .frame_extractor import extract_frames_batch
-from .title_card_scanner import find_episode_by_title_card
+from ocrnmr.frame_extractor import extract_frames_batch
+from ocrnmr.title_card_scanner import find_episode_by_title_card
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,8 @@ class FrameCache:
                 interval_seconds=config.get("frame_interval", 2.0),
                 max_dimension=config.get("max_dimension"),
                 duration=config.get("duration"),
-                hwaccel=config.get("hwaccel")
+                hwaccel=config.get("hwaccel"),
+                start_time=config.get("start_time")
             )
             extraction_time = time.time() - start_time
             
@@ -240,7 +241,7 @@ class FrameCache:
         
         # Kill any active FFMPEG processes aggressively (no wait)
         try:
-            from .frame_extractor import _active_processes
+            from ocrnmr.frame_extractor import _active_processes
             for proc in list(_active_processes):
                 try:
                     proc.kill()  # Kill immediately, don't wait

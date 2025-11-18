@@ -5,9 +5,9 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-from .frame_extractor import extract_frames, extract_frames_batch
-from .ocr_engine import extract_text_from_frame, initialize_reader
-from .episode_matcher import match_episode
+from ocrnmr.frame_extractor import extract_frames_batch
+from ocrnmr.ocr_engine import extract_text_from_frame, initialize_reader
+from ocrnmr.episode_matcher import match_episode
 
 # Set up logger
 logger = logging.getLogger(__name__)

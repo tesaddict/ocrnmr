@@ -63,7 +63,7 @@ class TMDBClient:
                 'season_number': episode_details['season_number']
             }
         except Exception as e:
-            print(f"Error fetching episode info: {str(e)}")
+            # Error handled silently - errors are shown via rich display at higher levels
             return None
 
     def get_season_episode_count(self, show_id: int, season: int) -> Optional[int]:
@@ -76,7 +76,7 @@ class TMDBClient:
             season_details = response.json()
             return len(season_details.get('episodes', []))
         except Exception as e:
-            print(f"Error fetching season info: {str(e)}")
+            # Error handled silently - errors are shown via rich display at higher levels
             return None
     
     def get_season(self, show_id: int, season: int) -> Optional[Dict]:
@@ -87,7 +87,7 @@ class TMDBClient:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            print(f"Error fetching season details: {str(e)}")
+            # Error handled silently - errors are shown via rich display at higher levels
             return None
     
     def get_show_details(self, show_id: int) -> Optional[Dict]:
@@ -98,7 +98,7 @@ class TMDBClient:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            print(f"Error fetching show details: {str(e)}")
+            # Error handled silently - errors are shown via rich display at higher levels
             return None
     
     def get_all_seasons(self, show_id: int) -> List[Dict]:
@@ -113,7 +113,7 @@ class TMDBClient:
             # For now, include all seasons
             return seasons
         except Exception as e:
-            print(f"Error fetching all seasons: {str(e)}")
+            # Error handled silently - errors are shown via rich display at higher levels
             return []
 
     def verify_show_and_season(self, show_name: str, season: int) -> tuple[Optional[int], Optional[int]]:

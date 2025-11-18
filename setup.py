@@ -20,7 +20,8 @@ setup(
         "easyocr>=1.7.0",
         "ffmpeg-python>=0.2.0",
         "pillow>=9.0.0",
-        "prompt-toolkit>=3.0.0",
+        "rapidfuzz>=2.0.0",
+        "requests>=2.25.0",
         "rich>=12.0.0",
     ],
     entry_points={

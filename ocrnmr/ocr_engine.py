@@ -1,8 +1,9 @@
 """OCR engine for extracting text from image frames using EasyOCR."""
 
-from typing import Optional, List
 import io
+import sys
 import warnings
+from typing import Optional, List
 
 try:
     from PIL import Image
@@ -74,96 +75,6 @@ def initialize_reader(gpu: Optional[bool] = None) -> None:
         ) from e
 
 
-def extract_text_from_frames_batch(frame_bytes_list: List[bytes]) -> List[Optional[str]]:
-    """
-    Extract text from multiple frames using EasyOCR batch processing.
-    
-    Note: This function has memory issues with large batches due to EasyOCR bugs.
-    Consider using extract_text_from_frame in a loop instead.
-    
-    Args:
-        frame_bytes_list: List of JPEG/PNG image bytes
-    
-    Returns:
-        List of extracted text strings (one per frame), or None for frames with no text or errors
-    
-    Raises:
-        RuntimeError: If EasyOCR or Pillow is not available
-    """
-    global EASYOCR_READER
-    
-    if Image is None:
-        raise RuntimeError(
-            "Pillow is not installed. Please install it with: pip install Pillow"
-        )
-    
-    if not has_easyocr:
-        raise RuntimeError(
-            "easyocr is not installed. Please install it with: pip install easyocr"
-        )
-    
-    try:
-        # Initialize reader if not already done
-        if EASYOCR_READER is None:
-            initialize_reader(gpu=None)  # Auto-detect GPU
-        
-        # Convert all frames to numpy arrays
-        img_arrays = []
-        for frame_bytes in frame_bytes_list:
-            try:
-                image_bytes_io = io.BytesIO(frame_bytes)
-                image = Image.open(image_bytes_io)
-                
-                # Convert to RGB if necessary
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                
-                img_array = np.array(image)
-                img_arrays.append(img_array)
-            except Exception:
-                # If frame conversion fails, add None to maintain list alignment
-                img_arrays.append(None)
-        
-        # Filter out None values and track indices
-        valid_indices = [i for i, arr in enumerate(img_arrays) if arr is not None]
-        valid_arrays = [arr for arr in img_arrays if arr is not None]
-        
-        if not valid_arrays:
-            return [None] * len(frame_bytes_list)
-        
-        # Run EasyOCR batch processing with vanilla settings
-        # Note: EasyOCR's readtext_batched has known memory calculation bugs for large batches
-        batch_results = EASYOCR_READER.readtext_batched(valid_arrays)
-        
-        # Process results and map back to original frame indices
-        results = [None] * len(frame_bytes_list)
-        for idx, valid_idx in enumerate(valid_indices):
-            frame_results = batch_results[idx]
-            
-            # Extract text with confidence filtering
-            words = []
-            for bbox, text, confidence in frame_results:
-                if confidence >= 0.3:  # 30% confidence threshold
-                    text_clean = text.strip()
-                    if text_clean and len(text_clean) > 1:  # Filter out single characters
-                        words.append(text_clean)
-            
-            # Combine all detected text
-            if words:
-                text = ' '.join(words)
-                text = ' '.join(text.split())  # Normalize whitespace
-                if text.strip():
-                    results[valid_idx] = text.strip()
-        
-        return results
-        
-    except Exception as e:
-        # Log the exception for debugging, but return None list to maintain compatibility
-        import sys
-        print(f"EasyOCR batch error: {type(e).__name__}: {e}", file=sys.stderr)
-        return [None] * len(frame_bytes_list)
-
-
 def extract_text_from_frame(frame_bytes: bytes) -> Optional[str]:
     """
     Extract text from a frame image using EasyOCR with vanilla settings.
@@ -232,7 +143,6 @@ def extract_text_from_frame(frame_bytes: bytes) -> Optional[str]:
         return None
         
     except Exception as e:
-        # Log the exception for debugging, but return None to maintain compatibility
-        import sys
-        print(f"EasyOCR error: {type(e).__name__}: {e}", file=sys.stderr)
+        # Return None on error - errors are handled at higher levels
+        # No need to print here as it will be noisy and errors are shown via rich display
         return None

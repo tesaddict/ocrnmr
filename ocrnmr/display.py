@@ -1,18 +1,18 @@
-"""Display module for OCR test progress using prompt_toolkit."""
+"""Display module for OCR test progress using rich."""
 
 import os
+import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
-from pathlib import Path
 from collections import deque
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-from prompt_toolkit import Application
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, FormattedTextControl
-from prompt_toolkit.layout.dimension import D
-from prompt_toolkit.styles import Style
-from typing import Any
+from rich.console import Console
+from rich.live import Live
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.text import Text
 
 # Import FORCE_EXIT flag from exit_flag module
 from ocrnmr.exit_flag import FORCE_EXIT
@@ -47,20 +47,12 @@ class OCRProgressDisplay:
         self.ocr_end_time: Optional[float] = None
         self.file_start_times: Dict[str, float] = {}  # Track start time per file
         
-        # Configuration display
-        self.config_info: Optional[str] = None
-        
-        # Rename preview
-        self.rename_preview: List[Tuple[str, Optional[str], Optional[str]]] = []
-        self.show_name = ""
-        self.season = 0
-        self.matched_count = 0
-        self.total_count = 0
-        self.show_preview = False
-        self.preview_layout: Optional[Layout] = None
+        # Error display
+        self.error_message: Optional[str] = None
         
         # UI components
-        self.app: Optional[Application] = None
+        self.console = Console()
+        self.live: Optional[Live] = None
         self.running = False
         self.early_exit_requested = False
         
@@ -77,7 +69,6 @@ class OCRProgressDisplay:
         self.terminal_height = terminal_height
         
         # Derived dimensions (calculated once at startup)
-        # Ensure dimensions don't exceed terminal size to prevent "window too small" errors
         # Top and bottom sections split terminal height 50/50
         self.top_section_height = terminal_height // 2
         self.bottom_section_height = terminal_height - self.top_section_height
@@ -91,16 +82,9 @@ class OCRProgressDisplay:
             self.bottom_section_height = MIN_SECTION_HEIGHT
             self.top_section_height = terminal_height - self.bottom_section_height
         
-        # Pane width: split terminal width equally, accounting for splitter
-        # Ensure total width doesn't exceed terminal width
-        calculated_pane_width = (terminal_width - 1) // 2  # Account for splitter (1 char)
+        # Pane width: split terminal width equally
+        calculated_pane_width = terminal_width // 2
         self.pane_width = max(30, calculated_pane_width)  # Minimum 30 chars per pane
-        
-        # Verify total width doesn't exceed terminal
-        total_width_needed = (self.pane_width * 2) + 1  # 2 panes + 1 splitter
-        if total_width_needed > terminal_width:
-            # Adjust pane width to fit
-            self.pane_width = (terminal_width - 1) // 2
         
         # Activity log max lines (calculated once)
         fixed_lines = 7  # Header, quit message, blank, file info, blank, status, separator
@@ -116,24 +100,24 @@ class OCRProgressDisplay:
             # Defaults if we can't determine terminal size
             return (80, 50)
     
-    def _get_ocr_pane_text(self):
-        """Get text for OCR pane."""
+    def _get_ocr_pane_content(self) -> Panel:
+        """Get content for OCR pane as a rich Panel."""
         with self.lock:
-            lines = []
-            lines.append(("class:header", " OCR Processing "))
-            lines.append(("class:log", " (Press 'e' for early exit, 'q' to quit, Ctrl+C to cancel)\n"))
-            lines.append(("", "\n"))
+            content_lines = []
+            content_lines.append(Text(" OCR Processing ", style="bold green on dark_blue"))
+            content_lines.append(Text(" (Press Ctrl+C to cancel)\n", style="dim"))
+            content_lines.append(Text("\n"))
             
             # Show current processing status
             if self.current_file:
-                lines.append(("class:label", f"Processing File "))
-                lines.append(("class:value", f"{self.current_file_index + 1}/{self.total_files}: {Path(self.current_file).name}\n"))
+                content_lines.append(Text("Processing File ", style="dim"))
+                content_lines.append(Text(f"{self.current_file_index + 1}/{self.total_files}: {Path(self.current_file).name}\n", style="bright_white"))
             else:
-                lines.append(("class:label", f"Processing File "))
-                lines.append(("class:value", f"-/{self.total_files}: -\n"))
+                content_lines.append(Text("Processing File ", style="dim"))
+                content_lines.append(Text(f"-/{self.total_files}: -\n", style="bright_white"))
             
-            lines.append(("", "\n"))
-            lines.append(("class:label", "Status: "))
+            content_lines.append(Text("\n"))
+            content_lines.append(Text("Status: ", style="dim"))
             # Normalize status display - use clearer status values
             status_display = self.ocr_status.lower()
             if status_display in ['processing', 'extracting', 'ocr']:
@@ -144,31 +128,51 @@ class OCRProgressDisplay:
                 status_display = "finished"
             else:
                 status_display = "standby"
-            lines.append(("class:value", f"{status_display}\n"))
+            content_lines.append(Text(f"{status_display}\n", style="bright_white"))
+            
+            # Show error message prominently if present
+            if self.error_message:
+                content_lines.append(Text("\n"))
+                separator_width = min(40, self.pane_width - 2)
+                content_lines.append(Text("─" * separator_width + "\n", style="red"))
+                content_lines.append(Text("ERROR:\n", style="bold red"))
+                # Split error message into lines and display
+                for line in self.error_message.split('\n'):
+                    if line.strip():
+                        content_lines.append(Text(f"  {line}\n", style="red"))
             
             # Show activity log - newest at top (bottom-up scrolling)
             if self.ocr_diagnostics:
-                lines.append(("", "\n"))
+                content_lines.append(Text("\n"))
                 separator_width = min(40, self.pane_width - 2)
-                lines.append(("class:label", "─" * separator_width + "\n"))
-                lines.append(("class:label", "Activity Log:\n"))
+                content_lines.append(Text("─" * separator_width + "\n", style="dim"))
+                content_lines.append(Text("Activity Log:\n", style="dim"))
                 # Get most recent messages and reverse them (newest first)
                 all_messages = list(self.ocr_diagnostics)
                 messages_to_show = all_messages[-self.activity_log_max_lines:] if len(all_messages) > self.activity_log_max_lines else all_messages
                 # Reverse so newest is at top
-                # Messages will wrap automatically due to wrap_lines=True
                 for msg in reversed(messages_to_show):
-                    lines.append(("class:log", f"  {msg}\n"))
+                    content_lines.append(Text(f"  {msg}\n", style="dim"))
             
-            return lines
+            # Combine all text lines
+            combined_text = Text()
+            for line in content_lines:
+                combined_text.append(line)
+            
+            return Panel(
+                combined_text,
+                title="OCR Processing",
+                border_style="green",
+                width=self.pane_width
+            )
     
-    def _get_ffmpeg_pane_text(self):
-        """Get text for FFMPEG pane."""
+    def _get_ffmpeg_pane_content(self) -> Panel:
+        """Get content for FFMPEG pane as a rich Panel."""
         with self.lock:
-            lines = []
-            lines.append(("class:header", " FFMPEG Extraction "))
-            lines.append(("class:log", " (Press 'e' for early exit, 'q' to quit, Ctrl+C to cancel)\n"))
-            lines.append(("", "\n"))
+            content_lines = []
+            content_lines.append(Text(" FFMPEG Extraction ", style="bold green on dark_blue"))
+            content_lines.append(Text(" (Press Ctrl+C to cancel)\n", style="dim"))
+            content_lines.append(Text("\n"))
             
             # Show current file being extracted
             # Prioritize current_ffmpeg_file if it has 'decoding' status (it's the one actually being extracted)
@@ -201,23 +205,23 @@ class OCRProgressDisplay:
             # Display the file
             if all_completed:
                 # All done - show total files completed
-                lines.append(("class:label", f"Processing File "))
-                lines.append(("class:value", f"{self.total_files}/{self.total_files}: All files\n"))
+                content_lines.append(Text("Processing File ", style="dim"))
+                content_lines.append(Text(f"{self.total_files}/{self.total_files}: All files\n", style="bright_white"))
             elif currently_extracting:
                 file_index = current_index + 1 if current_index >= 0 else 0
-                lines.append(("class:label", f"Processing File "))
-                lines.append(("class:value", f"{file_index}/{self.total_files}: {Path(currently_extracting).name}\n"))
+                content_lines.append(Text("Processing File ", style="dim"))
+                content_lines.append(Text(f"{file_index}/{self.total_files}: {Path(currently_extracting).name}\n", style="bright_white"))
             elif self.current_ffmpeg_file and self.current_ffmpeg_file_index >= 0:
                 # Show last processed file if we have an index
                 file_index = self.current_ffmpeg_file_index + 1
                 filename = self.current_ffmpeg_file
-                lines.append(("class:label", f"Processing File "))
-                lines.append(("class:value", f"{file_index}/{self.total_files}: {Path(filename).name}\n"))
+                content_lines.append(Text("Processing File ", style="dim"))
+                content_lines.append(Text(f"{file_index}/{self.total_files}: {Path(filename).name}\n", style="bright_white"))
             else:
-                lines.append(("class:label", f"Processing File "))
-                lines.append(("class:value", f"-/{self.total_files}: -\n"))
+                content_lines.append(Text("Processing File ", style="dim"))
+                content_lines.append(Text(f"-/{self.total_files}: -\n", style="bright_white"))
             
-            lines.append(("", "\n"))
+            content_lines.append(Text("\n"))
             
             # Show status - use clear status values: decoding, standby, finished
             currently_extracting = None
@@ -228,46 +232,55 @@ class OCRProgressDisplay:
                     break
             
             if all_completed:
-                lines.append(("class:label", "Status: "))
-                lines.append(("class:success", "finished\n"))
+                content_lines.append(Text("Status: ", style="dim"))
+                content_lines.append(Text("finished\n", style="green"))
             elif currently_extracting:
-                lines.append(("class:label", "Status: "))
-                lines.append(("class:value", "decoding\n"))
+                content_lines.append(Text("Status: ", style="dim"))
+                content_lines.append(Text("decoding\n", style="bright_white"))
             else:
-                lines.append(("class:label", "Status: "))
-                lines.append(("class:value", "standby\n"))
+                content_lines.append(Text("Status: ", style="dim"))
+                content_lines.append(Text("standby\n", style="bright_white"))
             
             # Show activity log - newest at top (bottom-up scrolling)
             if self.ffmpeg_log:
-                lines.append(("", "\n"))
+                content_lines.append(Text("\n"))
                 separator_width = min(40, self.pane_width - 2)
-                lines.append(("class:label", "─" * separator_width + "\n"))
-                lines.append(("class:label", "Activity Log:\n"))
+                content_lines.append(Text("─" * separator_width + "\n", style="dim"))
+                content_lines.append(Text("Activity Log:\n", style="dim"))
                 # Get most recent messages and reverse them (newest first)
                 all_messages = list(self.ffmpeg_log)
                 messages_to_show = all_messages[-self.activity_log_max_lines:] if len(all_messages) > self.activity_log_max_lines else all_messages
                 # Reverse so newest is at top
-                # Messages will wrap automatically due to wrap_lines=True
                 for msg in reversed(messages_to_show):
-                    lines.append(("class:log", f"  {msg}\n"))
+                    content_lines.append(Text(f"  {msg}\n", style="dim"))
             
-            return lines
+            # Combine all text lines
+            combined_text = Text()
+            for line in content_lines:
+                combined_text.append(line)
+            
+            return Panel(
+                combined_text,
+                title="FFMPEG Extraction",
+                border_style="green",
+                width=self.pane_width
+            )
     
-    def _get_summary_pane_text(self):
-        """Get text for summary pane showing all matches."""
+    def _get_summary_pane_content(self) -> Panel:
+        """Get content for summary pane showing all matches as a rich Panel."""
         with self.lock:
-            lines = []
-            lines.append(("class:header", " Matches "))
-            lines.append(("", "\n"))
+            content_lines = []
+            content_lines.append(Text(" Matches ", style="bold green on dark_blue"))
+            content_lines.append(Text("\n"))
             
             completed = len(self.completed_files)
             matched = sum(1 for f in self.completed_files if f.get('matched'))
             
-            lines.append(("class:label", f"Completed: "))
-            lines.append(("class:value", f"{completed}/{self.total_files}"))
-            lines.append(("", "  "))
-            lines.append(("class:label", f"Matched: "))
-            lines.append(("class:success", f"{matched}\n"))
+            content_lines.append(Text("Completed: ", style="dim"))
+            content_lines.append(Text(f"{completed}/{self.total_files}", style="bright_white"))
+            content_lines.append(Text("  ", style="dim"))
+            content_lines.append(Text("Matched: ", style="dim"))
+            content_lines.append(Text(f"{matched}\n", style="green"))
             
             # Show elapsed time if processing has started
             if self.ocr_start_time is not None:
@@ -288,16 +301,16 @@ class OCRProgressDisplay:
                     minutes = int((elapsed % 3600) // 60)
                     time_str = f"{hours}h {minutes}m"
                 
-                lines.append(("", "  "))
-                lines.append(("class:label", f"Elapsed: "))
-                lines.append(("class:value", f"{time_str}\n"))
+                content_lines.append(Text("  ", style="dim"))
+                content_lines.append(Text("Elapsed: ", style="dim"))
+                content_lines.append(Text(f"{time_str}\n", style="bright_white"))
             else:
-                lines.append(("", "\n"))
+                content_lines.append(Text("\n"))
             
-            lines.append(("", "\n"))
+            content_lines.append(Text("\n"))
             
             if self.completed_files:
-                lines.append(("class:label", "─" * 40 + "\n"))
+                content_lines.append(Text("─" * 40 + "\n", style="dim"))
                 # Show ALL matches - newest at top (reverse the list)
                 for result in reversed(self.completed_files):
                     file = result.get('file', 'unknown')
@@ -329,229 +342,106 @@ class OCRProgressDisplay:
                     
                     if matched_ep:
                         # Show filename with checkmark
-                        lines.append(("class:success", f"✓ "))
-                        lines.append(("class:value", f"{Path(file).name}"))
+                        content_lines.append(Text("✓ ", style="green"))
+                        content_lines.append(Text(f"{Path(file).name}", style="bright_white"))
                         if elapsed_str:
-                            lines.append(("class:log", elapsed_str))
+                            content_lines.append(Text(elapsed_str, style="dim"))
                         if timestamp_str:
-                            lines.append(("class:log", timestamp_str))
-                        lines.append(("", "\n"))
+                            content_lines.append(Text(timestamp_str, style="dim"))
+                        content_lines.append(Text("\n"))
                         # Show new filename (fully qualified rename)
                         if new_filename:
                             new_name_display = new_filename[:80] + "..." if len(new_filename) > 80 else new_filename
-                            lines.append(("class:log", f"  → {new_name_display}\n"))
+                            content_lines.append(Text(f"  → {new_name_display}\n", style="dim"))
                         else:
                             # Fallback: show episode name if new_filename not available
                             ep_name = matched_ep[:70] + "..." if len(matched_ep) > 70 else matched_ep
-                            lines.append(("class:log", f"  → {ep_name}\n"))
-                        lines.append(("", "\n"))
+                            content_lines.append(Text(f"  → {ep_name}\n", style="dim"))
+                        content_lines.append(Text("\n"))
                     else:
                         # Show filename with X for no match
-                        lines.append(("class:error", f"✗ "))
-                        lines.append(("class:value", f"{Path(file).name}"))
+                        content_lines.append(Text("✗ ", style="red"))
+                        content_lines.append(Text(f"{Path(file).name}", style="bright_white"))
                         if elapsed_str:
-                            lines.append(("class:log", elapsed_str))
-                        lines.append(("", "\n"))
-                        lines.append(("", "\n"))
+                            content_lines.append(Text(elapsed_str, style="dim"))
+                        content_lines.append(Text("\n"))
+                        content_lines.append(Text("\n"))
             else:
-                lines.append(("class:log", "No matches yet...\n"))
+                content_lines.append(Text("No matches yet...\n", style="dim"))
             
-            return lines
+            # Combine all text lines
+            combined_text = Text()
+            for line in content_lines:
+                combined_text.append(line)
+            
+            return Panel(
+                combined_text,
+                title="Matches",
+                border_style="cyan",
+                width=None  # Full width
+            )
     
-    def create_application(self) -> Application:
-        """Create the prompt_toolkit application."""
-        ocr_control = FormattedTextControl(self._get_ocr_pane_text)
-        ocr_window = Window(
-            content=ocr_control,
-            style='class:ocr-pane',
-            wrap_lines=True,  # Enable wrapping so messages wrap to new lines instead of expanding pane
-            width=D.exact(self.pane_width)  # Fixed width to prevent pane resizing
+    def _create_layout(self) -> Layout:
+        """Create the rich layout with three panes."""
+        # Create top section with two side-by-side panels
+        top_layout = Layout()
+        top_layout.split_row(
+            self._get_ocr_pane_content(),
+            self._get_ffmpeg_pane_content()
         )
         
-        ffmpeg_control = FormattedTextControl(self._get_ffmpeg_pane_text)
-        ffmpeg_window = Window(
-            content=ffmpeg_control,
-            style='class:ffmpeg-pane',
-            wrap_lines=True,  # Enable wrapping so messages wrap to new lines instead of expanding pane
-            width=D.exact(self.pane_width)  # Fixed width to prevent pane resizing
+        # Create main layout with top and bottom sections
+        main_layout = Layout()
+        main_layout.split_column(
+            top_layout,
+            self._get_summary_pane_content()
         )
         
-        summary_control = FormattedTextControl(self._get_summary_pane_text)
-        summary_window = Window(
-            content=summary_control,
-            style='class:summary-pane',
-            wrap_lines=False,
-            height=D.exact(self.bottom_section_height)  # Fixed height for bottom section
-        )
-        
-        # Layout: Top half = OCR | FFMPEG (side by side), Bottom half = Summary
-        # Use exact heights based on terminal size to ensure 50/50 split
-        # Create top section with exact height (OCR and FFMPEG side by side)
-        # VSplit divides width equally (50/50) for OCR and FFMPEG
-        top_section = VSplit([
-            ocr_window,
-            ffmpeg_window
-        ], height=D.exact(self.top_section_height))  # Exact height for top section
-        
-        # Bottom section
-        bottom_section = summary_window
-        
-        # HSplit with exact heights ensures 50/50 split
-        self.layout = Layout(
-            HSplit([
-                top_section,
-                bottom_section
-            ])
-        )
-        
-        kb = KeyBindings()
-        
-        @kb.add('e')
-        @kb.add('E')
-        def early_exit(event):
-            """Request early exit to preview window."""
-            self.early_exit_requested = True
-            self.running = False
-            event.app.exit()
-        
-        @kb.add('q')
-        @kb.add('Q')
-        @kb.add('escape')
-        def quit_app(event):
-            """Quit the application."""
-            self.running = False
-            event.app.exit()
-        
-        @kb.add('c-c')
-        def handle_ctrl_c(event):
-            """Handle Ctrl-C aggressively - kill everything immediately."""
-            # Set force exit flag
-            FORCE_EXIT.set()
-            self.running = False
-            self.early_exit_requested = False  # Ctrl-C means quit, not preview
-            
-            # Restore terminal before exiting
-            try:
-                import sys
-                import subprocess
-                # Try stty sane first (most reliable)
-                subprocess.run(['stty', 'sane'], timeout=0.1, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            except Exception:
-                # If stty fails, try termios
-                try:
-                    import termios
-                    if sys.stdin.isatty():
-                        attrs = termios.tcgetattr(sys.stdin.fileno())
-                        attrs[3] = attrs[3] & ~termios.ECHO & ~termios.ICANON
-                        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attrs)
-                except Exception:
-                    # Last resort: ANSI escape codes
-                    try:
-                        sys.stdout.write('\x1b[?25h')  # Show cursor
-                        sys.stdout.write('\x1b[0m')     # Reset colors
-                        sys.stdout.write('\r\n')        # New line
-                        sys.stdout.flush()
-                    except Exception:
-                        pass
-            
-            # Force immediate exit - bypasses app.exit() which might hang
-            os._exit(130)
-        
-        style = Style.from_dict({
-            'header': 'bg:#1e1e2e #a6e3a1 bold',
-            'label': '#6c7086',
-            'value': '#bac2de',
-            'success': '#a6e3a1',
-            'error': '#f38ba8',
-            'log': '#6c7086',
-            'ocr-pane': 'bg:#11111b',
-            'ffmpeg-pane': 'bg:#11111b',
-            'summary-pane': 'bg:#1e1e2e',
-        })
-        
-        app = Application(
-            layout=self.layout,
-            key_bindings=kb,
-            style=style,
-            full_screen=True,
-            mouse_support=True,  # Enable mouse support for scrolling
-            refresh_interval=0.1,  # Refresh 10 times per second
-            erase_when_done=False  # Don't clear screen when done
-        )
-        
-        self.app = app
-        return app
+        return main_layout
     
     def start(self):
         """Start the display in a separate thread."""
-        if self.app is None:
-            self.create_application()
-        
-        def run_app():
+        def run_display():
             self.running = True
             try:
-                # Run the app (this blocks until exit is called)
-                self.app.run()
+                # Clear screen before starting
+                self.console.clear()
+                # Use Live without screen mode for better compatibility with threads
+                # We'll manually clear and redraw to simulate full-screen behavior
+                initial_layout = self._create_layout()
+                with Live(initial_layout, refresh_per_second=1, screen=False, console=self.console) as live:
+                    self.live = live
+                    while self.running and not FORCE_EXIT.is_set():
+                        # Update the layout with fresh content (1Hz refresh rate)
+                        try:
+                            live.update(self._create_layout())
+                        except Exception as e:
+                            # If update fails, silently continue (display errors shouldn't crash the app)
+                            # Errors are already shown in the display itself
+                            pass
+                        time.sleep(1.0)
             except KeyboardInterrupt:
                 self.running = False
-                if self.app:
-                    try:
-                        self.app.exit()
-                    except Exception:
-                        pass
             except Exception as e:
-                import sys
-                print(f"Display error: {e}", file=sys.stderr)
-                import traceback
-                traceback.print_exc()
+                # Display errors shouldn't crash the app - just stop the display
                 self.running = False
             finally:
                 self.running = False
         
-        self.display_thread = threading.Thread(target=run_app, daemon=True)  # Daemon thread
+        self.display_thread = threading.Thread(target=run_display, daemon=True)
         self.display_thread.start()
         
         # Give it a moment to start and render
-        time.sleep(0.3)
+        time.sleep(0.5)
     
     def stop(self):
         """Stop the display."""
         # Check if force exit is requested - if so, exit immediately
         if FORCE_EXIT.is_set():
-            # Restore terminal before exiting
-            try:
-                import sys
-                import subprocess
-                # Try stty sane first (most reliable)
-                subprocess.run(['stty', 'sane'], timeout=0.1, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            except Exception:
-                # If stty fails, try termios
-                try:
-                    import termios
-                    if sys.stdin.isatty():
-                        attrs = termios.tcgetattr(sys.stdin.fileno())
-                        attrs[3] = attrs[3] & ~termios.ECHO & ~termios.ICANON
-                        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attrs)
-                except Exception:
-                    # Last resort: ANSI escape codes
-                    try:
-                        sys.stdout.write('\x1b[?25h')  # Show cursor
-                        sys.stdout.write('\x1b[0m')     # Reset colors
-                        sys.stdout.write('\r\n')        # New line
-                        sys.stdout.flush()
-                    except Exception:
-                        pass
             os._exit(130)
         
         self.running = False
-        if self.app:
-            try:
-                # Force exit the application
-                self.app.exit()
-            except Exception:
-                pass
-            # Don't wait for thread - it's a daemon thread and will exit when main thread exits
-            # Waiting can cause hangs if the app.run() is blocked
+        # The Live context manager will clean up automatically when the thread exits
     
     def update_ocr_status(self, file: str, index: int, total: int, status: str, 
                          frames_processed: int = 0, total_frames: int = 0, 
@@ -570,9 +460,6 @@ class OCRProgressDisplay:
             self.current_file_index = index
             self.total_files = total
             self.ocr_status = status
-        
-        if self.app:
-            self.app.invalidate()
     
     def add_ocr_completed(self, file: str, matched: Optional[str], status: str = ""):
         """Add a completed OCR file to the OCR pane."""
@@ -582,9 +469,6 @@ class OCRProgressDisplay:
                 'matched': matched,
                 'status': status
             })
-        
-        if self.app:
-            self.app.invalidate()
     
     def update_ffmpeg_status(self, filename: str, status: str, frames: int = 0, 
                             memory_mb: float = 0.0, message: str = "", file_index: Optional[int] = None):
@@ -609,11 +493,6 @@ class OCRProgressDisplay:
                 # Keep file name and index visible, just clear extracting status
                 # Don't clear current_ffmpeg_file or current_ffmpeg_file_index
                 pass
-            
-            # Don't add message to log here - it's handled by add_ffmpeg_diagnostic
-        
-        if self.app:
-            self.app.invalidate()
     
     def add_completed_file(self, file: str, matched: Optional[str], success: bool, new_filename: Optional[str] = None, match_timestamp: Optional[float] = None):
         """Add a completed file to the summary."""
@@ -634,32 +513,26 @@ class OCRProgressDisplay:
                 'new_filename': new_filename,
                 'match_timestamp': match_timestamp
             })
-        
-        if self.app:
-            self.app.invalidate()
     
     def add_ocr_diagnostic(self, message: str):
         """Add a diagnostic message to OCR pane."""
         with self.lock:
             self.ocr_diagnostics.append(f"[{time.strftime('%H:%M:%S')}] {message}")
-        
-        if self.app:
-            self.app.invalidate()
     
     def add_ffmpeg_diagnostic(self, message: str):
         """Add a diagnostic message to FFMPEG pane."""
         with self.lock:
             self.ffmpeg_log.append(f"[{time.strftime('%H:%M:%S')}] {message}")
-        
-        if self.app:
-            self.app.invalidate()
     
-    def set_config_info(self, config_text: str):
-        """Set configuration information to display."""
+    def show_error(self, error_message: str):
+        """Display an error message prominently in the display."""
         with self.lock:
-            self.config_info = config_text
+            self.error_message = error_message
+            self.ocr_status = "ERROR"
         
-        if self.app:
-            self.app.invalidate()
-    
-
+        # Force an immediate update
+        if self.live:
+            try:
+                self.live.update(self._create_layout())
+            except Exception:
+                pass
