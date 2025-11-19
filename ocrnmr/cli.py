@@ -171,12 +171,6 @@ Episodes File Format:
     
     # OCR settings (all optional with defaults)
     parser.add_argument(
-        "--max-dimension",
-        type=int,
-        default=800,
-        help="Maximum frame dimension in pixels (default: 800, use 0 for full resolution)"
-    )
-    parser.add_argument(
         "--duration",
         type=int,
         default=600,
@@ -191,8 +185,8 @@ Episodes File Format:
     parser.add_argument(
         "--match-threshold",
         type=float,
-        default=0.6,
-        help="Episode matching threshold 0.0-1.0 (default: 0.6, lower = more lenient)"
+        default=0.65,
+        help="Episode matching threshold 0.0-1.0 (default: 0.65, lower = more lenient)"
     )
     parser.add_argument(
         "--hwaccel",
@@ -209,7 +203,6 @@ Episodes File Format:
     
     # Build OCR config from CLI arguments
     ocr_config = {
-        "max_dimension": args.max_dimension if args.max_dimension > 0 else None,
         "duration": args.duration if args.duration > 0 else None,
         "frame_interval": args.frame_interval,
         "match_threshold": args.match_threshold,

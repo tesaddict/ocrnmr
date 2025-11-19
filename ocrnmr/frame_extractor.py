@@ -25,7 +25,8 @@ def _parse_mjpeg_frames_from_buffer(
     frames: List[Tuple[float, bytes]],
     interval_seconds: float,
     in_frame: bool,
-    frame_start: int
+    frame_start: int,
+    start_time: Optional[float] = None
 ) -> Tuple[bytearray, bool, int]:
     """
     Parse MJPEG frames from a buffer incrementally.
@@ -56,7 +57,7 @@ def _parse_mjpeg_frames_from_buffer(
             frame_bytes = bytes(buffer[frame_start:frame_end])
             
             # Calculate timestamp based on frame index
-            timestamp = len(frames) * interval_seconds
+            timestamp = (len(frames) * interval_seconds) + (start_time if start_time else 0)
             frames.append((timestamp, frame_bytes))
             
             # Remove processed frame data from buffer
@@ -76,7 +77,8 @@ def extract_frames_batch(
     max_dimension: Optional[int] = 800,
     duration: Optional[float] = None,
     hwaccel: Optional[str] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[float] = None,
+    timestamps: Optional[List[float]] = None
 ) -> List[Tuple[float, bytes]]:
     """
     Extract all frames from a video file in a single ffmpeg pass (batch extraction).
@@ -98,6 +100,9 @@ def extract_frames_batch(
                  'vaapi' for Linux, 'd3d11va'/'dxva2' for Windows). Significantly speeds up decode time.
         start_time: Start time in seconds for frame extraction (default: 0). If specified, extraction
                     starts from this timestamp. Useful for focusing on a specific region of the video.
+        timestamps: Optional list of specific timestamps to extract. If provided, extracts ONLY these frames.
+                    This uses a complex filter chain and may be slower per frame but faster for sparse extraction.
+                    Overrides interval_seconds, duration, and start_time.
     
     Returns:
         List of tuples (timestamp, frame_bytes) where timestamp is in seconds (relative to start_time)
@@ -147,22 +152,44 @@ def extract_frames_batch(
         
         # Apply duration limit and seek position as INPUT options
         # Using -ss before -i is faster than seeking after input
-        if start_time is not None:
-            input_kwargs['ss'] = start_time  # Start from specified time
-        elif duration is not None:
-            input_kwargs['ss'] = 0  # Start from beginning if duration is set
-        
-        if duration is not None:
-            input_kwargs['t'] = duration
+        if timestamps is None:
+            if start_time is not None:
+                input_kwargs['ss'] = start_time  # Start from specified time
+            elif duration is not None:
+                input_kwargs['ss'] = 0  # Start from beginning if duration is set
+            
+            if duration is not None:
+                input_kwargs['t'] = duration
         
         input_stream = ffmpeg.input(str(media_file), **input_kwargs)
         
         # Apply filters: scale first (if needed), then fps filter to extract at specified interval
         # Use nearest neighbor scaling for maximum speed (quality doesn't matter for OCR)
-        if max_dimension is not None:
-            filtered_stream = input_stream.filter('scale', max_dimension, -1, flags='neighbor').filter('fps', fps)
+        if timestamps is not None:
+            # Extract specific timestamps using select filter
+            # select='eq(t,T1)+eq(t,T2)+...'
+            select_expr = '+'.join([f"between(t,{t-0.1},{t+0.1})" for t in timestamps])
+            # print(f"DEBUG: select_expr={select_expr}")
+            # Use a slightly wider window (0.1s) to ensure we catch a frame near the timestamp
+            # Then force fps to match the number of timestamps to avoid duplicates
+            
+            # For specific timestamps, we can't use skip_frame=nokey as we need precise frames
+            # So we remove it from input_kwargs if it was added
+            if 'skip_frame' in input_kwargs:
+                del input_kwargs['skip_frame']
+            
+            # Re-create input stream with updated kwargs
+            input_stream = ffmpeg.input(str(media_file), **input_kwargs)
+            
+            if max_dimension is not None and max_dimension > 0:
+                filtered_stream = input_stream.filter('scale', max_dimension, -1, flags='neighbor').filter('select', select_expr)
+            else:
+                filtered_stream = input_stream.filter('select', select_expr)
         else:
-            filtered_stream = input_stream.filter('fps', fps)
+            if max_dimension is not None and max_dimension > 0:
+                filtered_stream = input_stream.filter('scale', max_dimension, -1, flags='neighbor').filter('fps', fps)
+            else:
+                filtered_stream = input_stream.filter('fps', fps)
         
         # Output to pipe as MJPEG stream (image2pipe format)
         # Optimized for MAXIMUM SPEED: lowest quality, fastest encoding
@@ -197,7 +224,9 @@ def extract_frames_batch(
             # If duration is specified, we should get approximately duration/interval_seconds frames
             # Add a small buffer (e.g., +1) to account for timing variations
             expected_frames = None
-            if duration is not None:
+            if timestamps is not None:
+                expected_frames = len(timestamps)
+            elif duration is not None:
                 expected_frames = int(duration / interval_seconds) + 1
             
             # Read stdout incrementally in chunks to avoid blocking
@@ -208,7 +237,7 @@ def extract_frames_batch(
             max_timeout = 300  # Maximum total timeout in seconds
             read_timeout = 1.0  # Timeout per read operation in seconds
             
-            start_time = time.time()
+            start_time_perf = time.time()
             
             # Parse MJPEG frames incrementally as data arrives
             # MJPEG frames are separated by JPEG markers:
@@ -219,7 +248,7 @@ def extract_frames_batch(
             
             while True:
                 # Check for overall timeout
-                if time.time() - start_time > max_timeout:
+                if time.time() - start_time_perf > max_timeout:
                     raise subprocess.TimeoutExpired(process.args, max_timeout)
                 
                 # If we have enough frames for the duration, stop reading early
@@ -238,7 +267,7 @@ def extract_frames_batch(
                             buffer.extend(remaining_data)
                             # Parse any complete frames from remaining data
                             buffer, in_frame, frame_start = _parse_mjpeg_frames_from_buffer(
-                                buffer, frames, interval_seconds, in_frame, frame_start
+                                buffer, frames, interval_seconds, in_frame, frame_start, start_time
                             )
                     except Exception:
                         pass
@@ -255,7 +284,7 @@ def extract_frames_batch(
                         buffer.extend(remaining_data)
                         # Parse frames from the remaining data before breaking
                         buffer, in_frame, frame_start = _parse_mjpeg_frames_from_buffer(
-                            buffer, frames, interval_seconds, in_frame, frame_start
+                            buffer, frames, interval_seconds, in_frame, frame_start, start_time
                         )
                     break
                 
@@ -281,7 +310,7 @@ def extract_frames_batch(
                                 buffer.extend(remaining_data)
                                 # Parse frames from the remaining data before breaking
                                 buffer, in_frame, frame_start = _parse_mjpeg_frames_from_buffer(
-                                    buffer, frames, interval_seconds, in_frame, frame_start
+                                    buffer, frames, interval_seconds, in_frame, frame_start, start_time
                                 )
                             break
                         # Process still running but no data yet - continue loop
@@ -306,13 +335,13 @@ def extract_frames_batch(
                             buffer.extend(remaining_data)
                             # Parse frames from the remaining data
                             buffer, in_frame, frame_start = _parse_mjpeg_frames_from_buffer(
-                                buffer, frames, interval_seconds, in_frame, frame_start
+                                buffer, frames, interval_seconds, in_frame, frame_start, start_time
                             )
                         break
                 
                 # Parse frames from buffer as data arrives
                 buffer, in_frame, frame_start = _parse_mjpeg_frames_from_buffer(
-                    buffer, frames, interval_seconds, in_frame, frame_start
+                    buffer, frames, interval_seconds, in_frame, frame_start, start_time
                 )
             
             # Wait for process to complete
@@ -352,8 +381,18 @@ def extract_frames_batch(
             if in_frame and len(buffer) > frame_start:
                 # Check if it looks like a valid JPEG
                 if buffer[frame_start] == 0xFF and buffer[frame_start + 1] == 0xD8:
-                    timestamp = len(frames) * interval_seconds
+                    timestamp = (len(frames) * interval_seconds) + (start_time if start_time else 0)
                     frames.append((timestamp, bytes(buffer[frame_start:])))
+            
+            # If using timestamps, fix up the returned timestamps to match requested ones
+            if timestamps is not None and len(frames) > 0:
+                # Map extracted frames to requested timestamps
+                # This is approximate since we can't guarantee exact frame alignment
+                mapped_frames = []
+                for i, (_, frame_data) in enumerate(frames):
+                    if i < len(timestamps):
+                        mapped_frames.append((timestamps[i], frame_data))
+                return mapped_frames
             
             return frames
             
@@ -389,4 +428,3 @@ def extract_frames_batch(
             
     except Exception as e:
         raise RuntimeError(f"Error extracting frames from {media_file}: {str(e)}")
-

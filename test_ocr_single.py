@@ -3,18 +3,21 @@
 Quick test script for OCR parameter tuning with a single file.
 
 This script allows rapid iteration on OCR parameters by:
-1. Loading all settings from ocr_config.json
+1. Loading settings from ocr_config.json (optional)
 2. Testing a single file with expected match
 3. Showing detailed diagnostic information
 4. Providing clear pass/fail results
 
 Usage:
     python3 test_ocr_single.py
+    python3 test_ocr_single.py --file /path/to/episode.mkv
+    python3 test_ocr_single.py --config ocr_config.json --file /path/to/episode.mkv
 
 To adjust parameters:
-    1. Edit ocr_config.json
-    2. Run the script again
-    3. Repeat until you get consistent matches
+    1. Create ocr_config.json (optional - defaults will be used if not present)
+    2. Edit ocr_config.json with OCR settings
+    3. Run the script again
+    4. Repeat until you get consistent matches
 
 The script will show:
     - Current configuration
@@ -37,30 +40,15 @@ from rich.panel import Panel
 from ocrnmr import find_episode_by_title_card
 from ocrnmr import extract_text_from_frame, match_episode, match_episode_with_scores
 from ocrnmr.processor import FrameCache
-from ocrnmr.cli import get_episode_titles
+from ocrnmr.episode_fetcher import fetch_episodes, load_episodes_file
 
 console = Console()
 
-# Load configuration from ocr_config.json
-CONFIG_FILE = Path(__file__).parent / "ocr_config.json"
+# Config will be loaded in main() - these are placeholders
 CONFIG = {}
-if CONFIG_FILE.exists():
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            CONFIG = json.load(f)
-        console.print(f"[green]✓ Loaded config from: {CONFIG_FILE}[/green]")
-    except Exception as e:
-        console.print(f"[red]✗ Could not load config file: {e}[/red]")
-        sys.exit(1)
-else:
-    console.print(f"[red]✗ Config file not found: {CONFIG_FILE}[/red]")
-    console.print("[yellow]Please create ocr_config.json first[/yellow]")
-    sys.exit(1)
-
-# Get OCR config with defaults
-OCR_CONFIG = CONFIG.get("ocr", {})
-DEBUG_CONFIG = CONFIG.get("debug", {})
-TEST_CONFIG = CONFIG.get("test", {})
+OCR_CONFIG = {}
+DEBUG_CONFIG = {}
+TEST_CONFIG = {}
 
 # Set up logging based on config
 log_level = getattr(logging, DEBUG_CONFIG.get("log_level", "INFO").upper(), logging.INFO)
@@ -68,7 +56,7 @@ log_level = getattr(logging, DEBUG_CONFIG.get("log_level", "INFO").upper(), logg
 # Logging will be configured in main()
 
 
-def print_config():
+def print_config(ocr_config: Dict):
     """Print current configuration."""
     
     config_lines = []
@@ -78,17 +66,17 @@ def print_config():
     table.add_column("Parameter", style="cyan")
     table.add_column("Value", style="green")
     
-    table.add_row("Max Dimension", str(OCR_CONFIG.get("max_dimension")) if OCR_CONFIG.get("max_dimension") else "Full resolution")
-    duration = OCR_CONFIG.get("duration")
+    table.add_row("Max Dimension", str(ocr_config.get("max_dimension")) if ocr_config.get("max_dimension") else "Full resolution")
+    duration = ocr_config.get("duration")
     table.add_row("Duration Limit", f"{duration}s ({duration/60:.1f} min)" if duration else "Full video")
-    table.add_row("Frame Interval", str(OCR_CONFIG.get("frame_interval", 1.0)))
-    table.add_row("Match Threshold", str(OCR_CONFIG.get("match_threshold", 0.6)))
+    table.add_row("Frame Interval", str(ocr_config.get("frame_interval", 2.0)))
+    table.add_row("Match Threshold", str(ocr_config.get("match_threshold", 0.6)))
     
     console.print(table)
     console.print()
 
 
-def print_frame_stats(video_file: Path):
+def print_frame_stats(video_file: Path, ocr_config: Dict):
     """Print frame extraction statistics."""
     if not DEBUG_CONFIG.get("show_frame_counts", False):
         return
@@ -101,13 +89,9 @@ def print_frame_stats(video_file: Path):
         video_duration = float(probe['format'].get('duration', 0))
         console.print(f"  Video duration: {video_duration:.1f}s ({video_duration/60:.1f} min)")
         
-        max_dimension = OCR_CONFIG.get("max_dimension")
-        if max_dimension is not None and max_dimension == 0:
-            max_dimension = None
-        duration = OCR_CONFIG.get("duration")
-        if duration is not None and duration == 0:
-            duration = None
-        frame_interval = OCR_CONFIG.get("frame_interval", 1.0)
+        max_dimension = ocr_config.get("max_dimension")
+        duration = ocr_config.get("duration")
+        frame_interval = ocr_config.get("frame_interval", 2.0)
         
         effective_duration = duration if duration else video_duration
         estimated_frames = int(effective_duration / frame_interval)
@@ -118,7 +102,7 @@ def print_frame_stats(video_file: Path):
         console.print(f"[yellow]  Could not calculate frame statistics: {e}[/yellow]\n")
 
 
-def test_single_file(test_file_config: dict, test_index: int = 0, total_tests: int = 1):
+def test_single_file(test_file_config: dict, ocr_config: Dict, test_index: int = 0, total_tests: int = 1):
     """
     Test OCR matching on a single file.
     
@@ -158,26 +142,20 @@ def test_single_file(test_file_config: dict, test_index: int = 0, total_tests: i
     
     # Print configuration (only on first test)
     if test_index == 0:
-        print_config()
+        print_config(ocr_config)
     
     # Print frame statistics
-    print_frame_stats(test_file)
+    print_frame_stats(test_file, ocr_config)
     
-    # Get OCR parameters from config, with overrides from test_file_config
-    max_dimension = OCR_CONFIG.get("max_dimension")
-    if max_dimension is not None and max_dimension == 0:
-        max_dimension = None
+    # Get OCR parameters from CLI args (already processed in main())
+    max_dimension = ocr_config.get("max_dimension")
     duration = test_file_config.get("duration")  # Use duration from test_file_config if available
     if duration is None:
-        duration = OCR_CONFIG.get("duration")
-    if duration is not None and duration == 0:
-        duration = None
-    frame_interval = test_file_config.get("frame_interval")
-    if frame_interval is None:
-        frame_interval = OCR_CONFIG.get("frame_interval", 1.0)
-    match_threshold = OCR_CONFIG.get("match_threshold", 0.6)
+        duration = ocr_config.get("duration")
+    frame_interval = ocr_config.get("frame_interval", 2.0)
+    match_threshold = ocr_config.get("match_threshold", 0.6)
     enable_profiling = True  # Profiling enabled by default
-    hwaccel = OCR_CONFIG.get("hwaccel")  # Hardware acceleration (can be null)
+    hwaccel = ocr_config.get("hwaccel")
     show_all_text = test_file_config.get("show_all_text", False)
     
     # Show extraction progress if enabled
@@ -292,19 +270,21 @@ def test_single_file(test_file_config: dict, test_index: int = 0, total_tests: i
             
             console.print()
             # Continue with normal matching after showing all text
-            pre_extracted_frames = frames
+            # IMPORTANT: Clear any cached frames so the two-pass matcher re-extracts and
+            # controls its own downscaled/full-res retries.
+            pre_extracted_frames = None 
         
         result = find_episode_by_title_card(
             test_file,
             EPISODE_TITLES,
             match_threshold=match_threshold,
             return_details=True,
-            max_dimension=max_dimension,
             duration=duration,
             frame_interval=frame_interval,
             enable_profiling=enable_profiling,
             hwaccel=hwaccel,
-            pre_extracted_frames=pre_extracted_frames
+            pre_extracted_frames=pre_extracted_frames,
+            start_time=start_time
         )
         
         # Display results
@@ -395,60 +375,121 @@ def test_single_file(test_file_config: dict, test_index: int = 0, total_tests: i
 
 
 def main():
-    """Main entry point for ocrnmr application."""
-    global CONFIG, OCR_CONFIG, DEBUG_CONFIG, TEST_CONFIG, EPISODE_TITLES, test_files_config
+    """Main entry point for OCR test script."""
+    global CONFIG, DEBUG_CONFIG, TEST_CONFIG, EPISODE_TITLES, test_files_config
     
-    # Parse command-line arguments
+    # Parse command-line arguments - similar to main CLI but with debug options
     parser = argparse.ArgumentParser(
         description="Test OCR parameter tuning with a single file or directory",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 test_ocr_single.py
-  python3 test_ocr_single.py --config stargate.json --file "/path/to/episode.mkv"
-  python3 test_ocr_single.py --config stargate.json --file "/path/to/episode.mkv" --start-time 300
-  python3 test_ocr_single.py --config stargate.json --file "/path/to/episode.mkv" --start-time 310 --end-time 320
-  python3 test_ocr_single.py --config stargate.json --file "/path/to/episode.mkv" --start-time 310 --end-time 320 --show-all-text
+  # Test single file with TMDB:
+  python3 test_ocr_single.py --show "Star Trek: TNG" --season 1 --file "/path/to/episode.mkv"
+  
+  # Test with custom episodes file:
+  python3 test_ocr_single.py --show "Dragon Ball Z Kai" --season 5 --file "/path/to/episode.mkv" --episodes-file episode_config.json
+  
+  # Test specific time range:
+  python3 test_ocr_single.py --show "The Office" --season 1 --file "/path/to/episode.mkv" --start-time 300 --end-time 320
+  
+  # Show all OCR text for debugging:
+  python3 test_ocr_single.py --show "Stargate SG-1" --season 2 --file "/path/to/episode.mkv" --show-all-text
+  
+  # Override OCR settings:
+  python3 test_ocr_single.py --show "The Simpsons" --season 1 --file "/path/to/episode.mkv" --max-dimension 1200 --match-threshold 0.5
         """
     )
+    
+    # Required arguments (same as main CLI)
     parser.add_argument(
-        "--config",
+        "--show",
         type=str,
-        default=None,
-        help="Path to config file (default: ocr_config.json)"
+        required=True,
+        help="TV show name (required)"
+    )
+    parser.add_argument(
+        "--season",
+        type=int,
+        required=True,
+        help="Season number (required)"
     )
     parser.add_argument(
         "--file",
         type=str,
-        default=None,
-        help="Path to a single file to test (overrides test_directory)"
+        required=True,
+        help="Path to a single video file to test (required)"
     )
+    
+    # Optional arguments (same as main CLI)
+    parser.add_argument(
+        "--episodes-file",
+        type=str,
+        default=None,
+        help="Path to JSON file containing custom episodes array (optional, only needed when TMDB doesn't have complete info)"
+    )
+    parser.add_argument(
+        "--tmdb-key",
+        type=str,
+        default=None,
+        help="TMDB API key (optional, can also use TMDB_API_KEY environment variable)"
+    )
+    
+    # OCR settings (same as main CLI, all optional with defaults)
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=600,
+        help="Maximum duration to process in seconds (default: 600 = 10 minutes, use 0 for full video)"
+    )
+    parser.add_argument(
+        "--frame-interval",
+        type=float,
+        default=2.0,
+        help="Interval between frames in seconds (default: 2.0)"
+    )
+    parser.add_argument(
+        "--match-threshold",
+        type=float,
+        default=0.65,
+        help="Episode matching threshold 0.0-1.0 (default: 0.65, lower = more lenient)"
+    )
+    parser.add_argument(
+        "--hwaccel",
+        type=str,
+        default=None,
+        choices=['videotoolbox', 'vaapi', 'd3d11va', 'dxva2'],
+        help="Hardware acceleration: videotoolbox (macOS), vaapi (Linux), d3d11va/dxva2 (Windows). Default: None (software)"
+    )
+    
+    # Debug/test-specific arguments
     parser.add_argument(
         "--start-time",
         type=float,
         default=None,
-        help="Start time in seconds for frame extraction (default: 0)"
+        help="Start time in seconds for frame extraction (debug option, default: 0)"
     )
     parser.add_argument(
         "--end-time",
         type=float,
         default=None,
-        help="End time in seconds for frame extraction (overrides duration if set)"
+        help="End time in seconds for frame extraction (debug option, overrides duration if set)"
     )
     parser.add_argument(
         "--show-all-text",
         action="store_true",
-        help="Show all OCR text extracted from every frame"
+        help="Show all OCR text extracted from every frame (debug option)"
     )
     parser.add_argument(
-        "--frame-interval",
-        type=float,
+        "--config",
+        type=str,
         default=None,
-        help="Override frame interval in seconds (default: from config)"
+        help="Path to ocr_config.json for additional debug/test settings (optional)"
     )
+    
     args = parser.parse_args()
     
-    # Load configuration
+    # Load optional debug config file
     if args.config:
         CONFIG_FILE = Path(args.config).expanduser()
     else:
@@ -456,131 +497,101 @@ Examples:
         if not CONFIG_FILE.exists():
             CONFIG_FILE = Path(__file__).parent / "ocr_config.json"
     
-    if not CONFIG_FILE.exists():
-        console.print(f"[red]✗ Config file not found: {CONFIG_FILE}[/red]")
-        console.print("[yellow]Please create ocr_config.json or specify --config[/yellow]")
-        return 1
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                CONFIG = json.load(f)
+            console.print(f"[green]✓ Loaded debug config from: {CONFIG_FILE}[/green]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ Could not load debug config file: {e}[/yellow]")
+            CONFIG = {}
+    else:
+        CONFIG = {}
     
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            CONFIG = json.load(f)
-        console.print(f"[green]✓ Loaded config from: {CONFIG_FILE}[/green]")
-    except Exception as e:
-        console.print(f"[red]✗ Could not load config file: {e}[/red]")
-        return 1
-    
-    OCR_CONFIG = CONFIG.get("ocr", {})
     DEBUG_CONFIG = CONFIG.get("debug", {})
     TEST_CONFIG = CONFIG.get("test", {})
     
-    # Set up logging based on config
+    # Set up logging based on debug config
     log_level = getattr(logging, DEBUG_CONFIG.get("log_level", "INFO").upper(), logging.INFO)
-    
-    # Configure logging
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Test configuration from command-line or config file
-    test_files_config = []
+    # Validate test file
+    test_file = Path(args.file).expanduser()
+    if not test_file.exists():
+        console.print(f"[red]✗ Test file not found: {test_file}[/red]")
+        return 1
     
-    if args.file:
-        # Single file specified via command-line
-        test_file = Path(args.file).expanduser()
-        if not test_file.exists():
-            console.print(f"[red]✗ Test file not found: {test_file}[/red]")
+    # Calculate duration if end_time is specified
+    duration = args.duration if args.duration > 0 else None
+    if args.end_time is not None and args.start_time is not None:
+        duration = args.end_time - args.start_time
+    elif args.end_time is not None:
+        duration = args.end_time
+    
+    # Build OCR config from CLI arguments (same as main CLI)
+    ocr_config = {
+        "duration": duration,
+        "frame_interval": args.frame_interval,
+        "match_threshold": args.match_threshold,
+        "hwaccel": args.hwaccel,
+    }
+    
+    # Validate episodes file exists if provided
+    if args.episodes_file:
+        episodes_path = Path(args.episodes_file).expanduser()
+        if not episodes_path.exists():
+            console.print(f"[red]Error:[/red] Episodes file not found: {episodes_path}")
             return 1
-        # Calculate duration if end_time is specified
-        duration = None
-        if args.end_time is not None and args.start_time is not None:
-            duration = args.end_time - args.start_time
-        elif args.end_time is not None:
-            duration = args.end_time
-        
-        test_files_config.append({
-            "test_file": str(test_file), 
-            "start_time": args.start_time,
-            "end_time": args.end_time,
-            "duration": duration,
-            "show_all_text": args.show_all_text,
-            "frame_interval": args.frame_interval
-        })
-        console.print(f"[cyan]Testing single file: {test_file.name}[/cyan]")
-        if args.start_time is not None:
-            console.print(f"[cyan]Start time: {args.start_time:.1f}s[/cyan]")
-        if args.end_time is not None:
-            console.print(f"[cyan]End time: {args.end_time:.1f}s[/cyan]")
-        if duration is not None:
-            console.print(f"[cyan]Duration: {duration:.1f}s[/cyan]")
-    else:
-        # Use directory-based logic from config
-        test_directory = TEST_CONFIG.get("test_directory")
-        
-        if test_directory:
-            test_dir = Path(test_directory).expanduser()
-            if test_dir.exists() and test_dir.is_dir():
-                mkv_files = sorted(list(test_dir.glob("*.mkv")))
-                if mkv_files:
-                    for mkv_file in mkv_files:
-                        duration = None
-                        if args.end_time is not None and args.start_time is not None:
-                            duration = args.end_time - args.start_time
-                        elif args.end_time is not None:
-                            duration = args.end_time
-                        test_files_config.append({
-                            "test_file": str(mkv_file), 
-                            "start_time": args.start_time,
-                            "end_time": args.end_time,
-                            "duration": duration,
-                            "show_all_text": args.show_all_text,
-                            "frame_interval": args.frame_interval
-                        })
-                    console.print(f"[cyan]Found {len(mkv_files)} .mkv files in {test_dir}[/cyan]")
-                else:
-                    console.print(f"[yellow]No .mkv files found in {test_dir}[/yellow]")
-            else:
-                console.print(f"[red]Test directory not found: {test_dir}[/red]")
-                return 1
-        else:
-            # Fallback to default directory if test_directory is not set
-            default_dir = Path("~/rips/Dragon_Ball_Z_Kai/S5/").expanduser()
-            if default_dir.exists() and default_dir.is_dir():
-                mkv_files = sorted(list(default_dir.glob("*.mkv")))
-                if mkv_files:
-                    for mkv_file in mkv_files:
-                        duration = None
-                        if args.end_time is not None and args.start_time is not None:
-                            duration = args.end_time - args.start_time
-                        elif args.end_time is not None:
-                            duration = args.end_time
-                        test_files_config.append({
-                            "test_file": str(mkv_file), 
-                            "start_time": args.start_time,
-                            "end_time": args.end_time,
-                            "duration": duration,
-                            "show_all_text": args.show_all_text,
-                            "frame_interval": args.frame_interval
-                        })
-                    console.print(f"[cyan]Found {len(mkv_files)} .mkv files in {default_dir}[/cyan]")
-                else:
-                    console.print(f"[yellow]No .mkv files found in {default_dir}[/yellow]")
-            else:
-                console.print(f"[yellow]No test configuration found. Please set test_directory in config or use --file[/yellow]")
-                test_files_config = []
     
-    # Get episode titles for fuzzy matching from config's show section
+    # Prepare test file config
+    test_files_config = [{
+        "test_file": str(test_file),
+        "start_time": args.start_time,
+        "end_time": args.end_time,
+        "duration": duration,
+        "show_all_text": args.show_all_text,
+    }]
+    
+    console.print(f"[cyan]Testing file: {test_file.name}[/cyan]")
+    if args.start_time is not None:
+        console.print(f"[cyan]Start time: {args.start_time:.1f}s[/cyan]")
+    if args.end_time is not None:
+        console.print(f"[cyan]End time: {args.end_time:.1f}s[/cyan]")
+    if duration is not None:
+        console.print(f"[cyan]Duration: {duration:.1f}s[/cyan]")
+    
+    # Fetch episodes from TMDB and/or episodes file (same as main CLI)
+    show_name = args.show
+    season = args.season
+    episodes_file_path = Path(args.episodes_file).expanduser() if args.episodes_file else None
+    
     try:
-        EPISODE_TITLES = get_episode_titles(CONFIG, display=None)
+        EPISODE_TITLES, episode_info = fetch_episodes(
+            show_name=show_name,
+            season=season,
+            tmdb_api_key=args.tmdb_key,
+            episodes_file=episodes_file_path,
+            display=None
+        )
         console.print(f"[green]✓ Loaded {len(EPISODE_TITLES)} episode titles[/green]")
-    except Exception as e:
-        console.print(f"[yellow]⚠ Could not load episode titles from config: {e}[/yellow]")
-        # Fallback to test config or hardcoded defaults
+    except SystemExit:
+        # fetch_episodes exits if no episodes found - use fallback
+        console.print(f"[yellow]⚠ Could not load episodes, using fallback titles[/yellow]")
         EPISODE_TITLES = TEST_CONFIG.get("episode_titles", [
             "Seven Years Later! Starting Today, Gohan Is a High School Student",
             "7 Years Since That Event! Starting Today, Gohan's a High Schooler"
         ])
-        console.print(f"[yellow]Using fallback episode titles: {len(EPISODE_TITLES)} titles[/yellow]")
+        episode_info = {}
+    except Exception as e:
+        console.print(f"[yellow]⚠ Error loading episodes: {e}[/yellow]")
+        EPISODE_TITLES = TEST_CONFIG.get("episode_titles", [
+            "Seven Years Later! Starting Today, Gohan Is a High School Student",
+            "7 Years Since That Event! Starting Today, Gohan's a High Schooler"
+        ])
+        episode_info = {}
     
     total_tests = len(test_files_config)
     results = []
@@ -597,22 +608,22 @@ Examples:
     # Make frame_cache available to test_single_file via globals
     globals()['frame_cache'] = frame_cache
     
-    # Prepare extraction config
+    # Prepare extraction config from ocr_config
     # Get start_time from first test file config (if specified)
     start_time = None
     if test_files_config and test_files_config[0].get("start_time") is not None:
         start_time = test_files_config[0].get("start_time")
     
     extraction_config = {
-        "max_dimension": OCR_CONFIG.get("max_dimension"),
-        "duration": OCR_CONFIG.get("duration"),
-        "frame_interval": OCR_CONFIG.get("frame_interval", 2.0),
-        "hwaccel": OCR_CONFIG.get("hwaccel"),
+        "max_dimension": ocr_config.get("max_dimension"),
+        "duration": ocr_config.get("duration"),
+        "frame_interval": ocr_config.get("frame_interval", 2.0),
+        "hwaccel": ocr_config.get("hwaccel"),
         "start_time": start_time
     }
     
     # Start extraction for ALL files immediately - push ahead as fast as possible
-    # This allows FFMPEG to finish early and free resources for EasyOCR
+    # This allows FFmpeg to finish early and free resources for EasyOCR
     if test_files_config:
         for file_idx, test_file_config in enumerate(test_files_config):
             file_path = Path(test_file_config.get("test_file", "")).expanduser()
@@ -624,9 +635,6 @@ Examples:
                 file_extraction_config["start_time"] = file_start_time
             if file_duration is not None:
                 file_extraction_config["duration"] = file_duration
-            file_frame_interval = test_file_config.get("frame_interval")
-            if file_frame_interval is not None:
-                file_extraction_config["frame_interval"] = file_frame_interval
             frame_cache.start_extraction(file_path, file_extraction_config)
     
     # Run all test files
@@ -634,7 +642,7 @@ Examples:
         test_file_path = Path(test_file_config.get("test_file", "")).expanduser()
         
         # Process current file (frames should already be ready or will wait)
-        success, matched_episode = test_single_file(test_file_config, test_index=idx, total_tests=total_tests)
+        success, matched_episode = test_single_file(test_file_config, ocr_config, test_index=idx, total_tests=total_tests)
         results.append(success)
         matches.append((test_file_path, matched_episode))
         
@@ -644,45 +652,27 @@ Examples:
     # Shutdown frame cache executor
     frame_cache.shutdown()
     
-    # Generate rename preview data
-    # Try to determine show name and season from directory structure
-    # Default to "Dragon Ball Z Kai" and season 5 if we can't determine
-    show_name = "Dragon Ball Z Kai"
-    season = 5
-    
-    if test_files_config:
-        first_file = Path(test_files_config[0].get("test_file", "")).expanduser()
-        if first_file.exists():
-            # Try to extract from directory path (e.g., ~/rips/Dragon_Ball_Z_Kai/S5/)
-            parts = first_file.parent.parts
-            for i, part in enumerate(parts):
-                if part.startswith('S') and part[1:].isdigit():
-                    season = int(part[1:])
-                    # Show name might be in parent directory
-                    if i > 0:
-                        show_name = parts[i-1].replace('_', ' ').title()
-                    break
-    
+    # Generate rename preview data using show_name and season from CLI args
     # Import filename generation function
     from ocrnmr.filename import sanitize_filename
     
-    # Group matches by episode to assign episode numbers
-    episode_to_num = {}
-    episode_num = 1
-    for file_path, matched_episode in matches:
-        if matched_episode and matched_episode not in episode_to_num:
-            episode_to_num[matched_episode] = episode_num
-            episode_num += 1
-    
-    # Generate rename preview
+    # Generate rename preview using episode_info if available
     rename_preview = []
-    for idx, (file_path, matched_episode) in enumerate(matches):
+    for file_path, matched_episode in matches:
         original_name = file_path.name
         ext = file_path.suffix
         
         if matched_episode:
-            ep_num = episode_to_num.get(matched_episode, idx + 1)
-            new_name = f"{show_name} - S{season:02d}E{ep_num:02d} - {matched_episode}{ext}"
+            # Use episode_info if available, otherwise sequential numbering
+            if matched_episode in episode_info:
+                ep_season, ep_num = episode_info[matched_episode]
+                new_name = f"{show_name} - S{ep_season:02d}E{ep_num:02d} - {matched_episode}{ext}"
+            else:
+                # Fallback to sequential numbering
+                unique_episodes = set(ep for _, ep, _ in rename_preview if ep)
+                ep_num = len(unique_episodes) + 1
+                new_name = f"{show_name} - S{season:02d}E{ep_num:02d} - {matched_episode}{ext}"
+            
             new_name = sanitize_filename(new_name)
             rename_preview.append((original_name, new_name, matched_episode))
         else:

@@ -42,7 +42,7 @@ def match_episode(
     normalized_extracted = extracted_text.lower()
     # Replace common punctuation variations with spaces for better matching
     # This handles cases like "Today;" vs "Today," vs "Today!"
-    for punct in '!?;:.,':
+    for punct in '!?;:.,\'"':
         normalized_extracted = normalized_extracted.replace(punct, ' ')
     normalized_extracted = ' '.join(normalized_extracted.split())
     
@@ -69,7 +69,7 @@ def match_episode(
         # Normalize episode name similarly
         normalized_episode = episode_name.lower()
         # Replace punctuation with spaces for consistent matching
-        for punct in '!?;:.,':
+        for punct in '!?;:.,\'"':
             normalized_episode = normalized_episode.replace(punct, ' ')
         normalized_episode = ' '.join(normalized_episode.split())
         
@@ -156,7 +156,7 @@ def match_episode_with_scores(
     
     # Normalize extracted text - remove extra whitespace, normalize punctuation
     normalized_extracted = extracted_text.lower()
-    for punct in '!?;:.,':
+    for punct in '!?;:.,\'"':
         normalized_extracted = normalized_extracted.replace(punct, ' ')
     normalized_extracted = ' '.join(normalized_extracted.split())
     
@@ -175,7 +175,7 @@ def match_episode_with_scores(
         
         # Normalize episode name similarly
         normalized_episode = episode_name.lower()
-        for punct in '!?;:.,':
+        for punct in '!?;:.,\'"':
             normalized_episode = normalized_episode.replace(punct, ' ')
         normalized_episode = ' '.join(normalized_episode.split())
         

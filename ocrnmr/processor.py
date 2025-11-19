@@ -75,7 +75,8 @@ class FrameCache:
             frames = extract_frames_batch(
                 file_path,
                 interval_seconds=config.get("frame_interval", 2.0),
-                max_dimension=config.get("max_dimension"),
+                # Always extract at full resolution; downscaling happens later in Python
+                max_dimension=None,
                 duration=config.get("duration"),
                 hwaccel=config.get("hwaccel"),
                 start_time=config.get("start_time")
@@ -297,14 +298,12 @@ class PipelinedOCRProcessor:
         ocr_config = {
             'frame_interval': config.get("frame_interval", 2.0),
             'match_threshold': config.get("match_threshold", 0.6),
-            'max_dimension': config.get("max_dimension"),
             'duration': config.get("duration"),
-            'hwaccel': config.get("hwaccel")
+            'hwaccel': config.get("hwaccel"),
+            'start_time': config.get("start_time"),
         }
         
         # Handle None/0 values
-        if ocr_config['max_dimension'] is not None and ocr_config['max_dimension'] == 0:
-            ocr_config['max_dimension'] = None
         if ocr_config['duration'] is not None and ocr_config['duration'] == 0:
             ocr_config['duration'] = None
         
@@ -348,12 +347,12 @@ class PipelinedOCRProcessor:
                     episode_titles,
                     match_threshold=ocr_config['match_threshold'],
                     return_details=True,  # Return timestamp for display
-                    max_dimension=ocr_config['max_dimension'],
                     duration=ocr_config['duration'],
                     frame_interval=ocr_config['frame_interval'],
                     enable_profiling=False,
                     hwaccel=ocr_config['hwaccel'],
-                    pre_extracted_frames=pre_extracted_frames
+                    pre_extracted_frames=pre_extracted_frames,
+                    start_time=ocr_config.get("start_time")
                 )
                 
                 if result:
