@@ -12,7 +12,7 @@ except ImportError:
     Image = None
 
 from ocrnmr.frame_extractor import extract_frames_batch
-from ocrnmr.ocr_engine import extract_text_from_frame, initialize_reader
+from ocrnmr.ocr_engine import extract_text_from_batch, extract_text_from_frame, initialize_reader
 from ocrnmr.episode_matcher import match_episode
 
 # Set up logger
@@ -51,8 +51,8 @@ def find_episode_by_title_card(
     frame_interval: float = 1.0,
     enable_profiling: bool = True,
     hwaccel: Optional[str] = None,
-    pre_extracted_frames: Optional[List[Tuple[float, bytes]]] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[float] = None,
+    max_dimension: Optional[int] = None
 ) -> Union[Optional[Tuple[Path, str]], Optional[Tuple[Path, str, float, str]]]:
     """
     Scan a video file for title cards and match against episode names.
@@ -70,22 +70,12 @@ def find_episode_by_title_card(
         frame_interval: Interval between frames in seconds (default: 1.0)
         enable_profiling: If True, log FFMPEG and OCR timing information at INFO level (default: True)
         hwaccel: Hardware acceleration for decoding (None for software, 'videotoolbox' for macOS, 'vaapi' for Linux, 'd3d11va'/'dxva2' for Windows)
-        pre_extracted_frames: Optional pre-extracted frames list. If provided, skips FFMPEG extraction and uses these frames directly.
-                            Useful for pipelined extraction where frames are extracted in background (default: None)
         start_time: Optional start time (seconds) for extraction. Used when falling back to synchronous extraction.
+        max_dimension: Maximum width/height for OCR. If set, frames are resized by ffmpeg.
     
     Returns:
         If return_details=False: Tuple of (media_file, episode_name) if match found, else None
         If return_details=True: Tuple of (media_file, episode_name, timestamp, extracted_text) if match found, else None
-    
-    Example:
-        >>> result = find_episode_by_title_card(
-        ...     Path("episode.mkv"),
-        ...     ["Pilot", "The Second Episode", "Finale"]
-        ... )
-        >>> if result:
-        ...     file_path, episode_name = result
-        ...     print(f"Found: {episode_name}")
     """
     if not media_file.exists():
         return None
@@ -94,19 +84,17 @@ def find_episode_by_title_card(
         return None
     
     # Verify EasyOCR is available upfront
-    # Initialize with GPU auto-detection for better performance
     try:
-        initialize_reader(gpu=None)  # Auto-detect GPU (MPS for Apple Silicon, CUDA for NVIDIA)
+        initialize_reader(gpu=None)  # Auto-detect GPU
     except Exception:
-        # If initialization fails, let extract_text_from_frame handle it
         pass
     
     try:
         result = _find_episode_sequential(
             media_file, episode_names, match_threshold, return_details,
             duration, frame_interval, enable_profiling, hwaccel,
-            pre_extracted_frames=pre_extracted_frames,
-            start_time=start_time
+            start_time=start_time,
+            max_dimension=max_dimension
         )
         
         # If return_details is False and result has details, strip them
@@ -114,7 +102,6 @@ def find_episode_by_title_card(
             return (result[0], result[1])
         return result
     except Exception:
-        # Return None on any error
         return None
 
 
@@ -127,127 +114,96 @@ def _find_episode_sequential(
     frame_interval: float = 1.0,
     enable_profiling: bool = True,
     hwaccel: Optional[str] = None,
-    pre_extracted_frames: Optional[List[Tuple[float, bytes]]] = None,
-    start_time: Optional[float] = None
+    start_time: Optional[float] = None,
+    max_dimension: Optional[int] = None
 ) -> Optional[Tuple]:
     """
     Sequential processing: extract all frames at once using batch extraction, then process them.
-    
-    Uses batch extraction - all frames are extracted first, then processed sequentially.
-    This allows for accurate timing measurements of FFMPEG vs OCR processing time.
-    
-    Args:
-        pre_extracted_frames: Optional pre-extracted frames list. If provided, skips FFMPEG extraction
-                             and uses these frames directly. FFMPEG time will be reported as 0.0.
     """
     try:
         frame_count = 0
-        target_dimension = None
         
-        # Extract all frames using batch extraction (or use pre-extracted frames)
+        # Extract all frames using batch extraction
         ffmpeg_start = time.time()
-        if pre_extracted_frames is not None:
-            frames = pre_extracted_frames
-            ffmpeg_time = 0.0  # Already done in background
-            if enable_profiling:
-                logger.info(f"Using pre-extracted frames ({len(frames)} frames, FFMPEG time already accounted)")
+        
+        if duration:
+            logger.info(f"Extracting frames from ffmpeg (first {duration:.1f}s / {duration/60:.1f} min)...")
         else:
-            if duration:
-                logger.info(f"Extracting frames from ffmpeg (first {duration:.1f}s / {duration/60:.1f} min)...")
-            else:
-                logger.info("Extracting frames from ffmpeg...")
-            frames = extract_frames_batch(
-                media_file,
-                interval_seconds=frame_interval,
-                max_dimension=None,  # Always extract at full resolution
-                duration=duration,
-                hwaccel=hwaccel,
-                start_time=start_time
-            )
+            logger.info("Extracting frames from ffmpeg...")
+            
+        frames = extract_frames_batch(
+            media_file,
+            interval_seconds=frame_interval,
+            max_dimension=max_dimension,  # Use ffmpeg scaling if provided
+            duration=duration,
+            hwaccel=hwaccel,
+            start_time=start_time
+        )
         
         ffmpeg_time = time.time() - ffmpeg_start
         if enable_profiling:
             logger.info(f"FFMPEG extraction completed in {ffmpeg_time:.2f}s ({len(frames)} frames)")
         
-        # Process frames individually to avoid memory issues
+        # Process frames in batches
         ocr_start = time.time()
         frame_count = 0
         
-        candidate_frames: List[Tuple[float, bytes]] = []
+        # Determine if we need Python-side resizing
+        use_heuristic_downscale = (max_dimension is None)
+        target_dimension = None
         
-        for timestamp, frame_bytes in frames:
-            frame_count += 1
-            if frame_count % 50 == 0:
-                logger.info(f"Processed {frame_count} frames, current timestamp: {int(timestamp // 60):02d}:{int(timestamp % 60):02d}")
-            
-            try:
-                image = _load_image_from_bytes(frame_bytes)
-            except Exception as exc:
-                logger.debug(f"Skipping frame {frame_count}: could not load image ({exc})")
-                continue
-            
-            if target_dimension is None:
-                width, height = image.size
-                longest_side = max(width, height)
-                computed = int(longest_side / 2)
-                if computed > 0 and computed < longest_side:
-                    target_dimension = computed
-                    logger.info(f"Heuristic downscale enabled: {longest_side}px → {target_dimension}px")
-            
-            extracted_text = None
-            if target_dimension:
-                resized_image = _resize_image(image, target_dimension)
-                extracted_text = extract_text_from_frame(resized_image)
-                if extracted_text:
-                    logger.info(f"Downscaled OCR at {timestamp:.1f}s: '{extracted_text}'")
-            else:
-                extracted_text = extract_text_from_frame(image)
-            
-            if not extracted_text:
-                continue
-            
-            matched_episode = match_episode(
-                extracted_text,
-                episode_names,
-                threshold=match_threshold
-            )
-            
-            if matched_episode:
-                match_min = int(timestamp // 60)
-                match_sec = int(timestamp % 60)
-                logger.info(
-                    f"Match found (downscaled) at {match_min:02d}:{match_sec:02d}: {matched_episode} (after {frame_count} frames)"
-                )
-                ocr_time = time.time() - ocr_start
-                if enable_profiling:
-                    logger.info(f"Total FFMPEG time: {ffmpeg_time:.2f}s, Total OCR processing time: {ocr_time:.2f}s")
-                if return_details:
-                    return (media_file, matched_episode, timestamp, extracted_text)
-                else:
-                    return (media_file, matched_episode)
-            
-            # Store for later full-res retry if we were operating in downscaled mode
-            if target_dimension:
-                candidate_frames.append((timestamp, frame_bytes))
+        # Batch size for OCR
+        BATCH_SIZE = 16
         
-        # Full-resolution retry pass for frames where text was detected but no match
-        if target_dimension and candidate_frames:
-            logger.info(f"No match after downscaled pass. Retrying {len(candidate_frames)} candidate frames at full resolution...")
-            for timestamp, frame_bytes in candidate_frames:
+        # Process frames in chunks
+        for i in range(0, len(frames), BATCH_SIZE):
+            batch_frames = frames[i:i+BATCH_SIZE]
+            batch_images = []
+            batch_timestamps = []
+            
+            # Load and preprocess images for this batch
+            for timestamp, frame_bytes in batch_frames:
+                frame_count += 1
+                if frame_count % 50 == 0:
+                    logger.info(f"Processed {frame_count} frames, current timestamp: {int(timestamp // 60):02d}:{int(timestamp % 60):02d}")
+                
                 try:
                     image = _load_image_from_bytes(frame_bytes)
+                    
+                    # Apply heuristic downscaling if needed
+                    if use_heuristic_downscale:
+                        if target_dimension is None:
+                            width, height = image.size
+                            longest_side = max(width, height)
+                            computed = int(longest_side / 2)
+                            if computed > 0 and computed < longest_side:
+                                target_dimension = computed
+                                logger.info(f"Heuristic downscale enabled: {longest_side}px → {target_dimension}px")
+                        
+                        if target_dimension:
+                            image = _resize_image(image, target_dimension)
+                            
+                    batch_images.append(image)
+                    batch_timestamps.append(timestamp)
                 except Exception as exc:
-                    logger.debug(f"Skipping candidate frame at {timestamp:.1f}s: could not load image ({exc})")
+                    logger.debug(f"Skipping frame at {timestamp:.1f}s: could not load image ({exc})")
                     continue
+            
+            if not batch_images:
+                continue
                 
-                full_res_text = extract_text_from_frame(image)
-                if not full_res_text:
+            # Run batch OCR
+            batch_texts = extract_text_from_batch(batch_images)
+            
+            # Check results
+            for j, extracted_text in enumerate(batch_texts):
+                if not extracted_text:
                     continue
-                
-                logger.info(f"Full-res OCR (retry) at {timestamp:.1f}s: '{full_res_text}'")
+                    
+                timestamp = batch_timestamps[j]
                 
                 matched_episode = match_episode(
-                    full_res_text,
+                    extracted_text,
                     episode_names,
                     threshold=match_threshold
                 )
@@ -256,13 +212,13 @@ def _find_episode_sequential(
                     match_min = int(timestamp // 60)
                     match_sec = int(timestamp % 60)
                     logger.info(
-                        f"Match found (full_res) at {match_min:02d}:{match_sec:02d}: {matched_episode}"
+                        f"Match found at {match_min:02d}:{match_sec:02d}: {matched_episode} (after {frame_count} frames)"
                     )
                     ocr_time = time.time() - ocr_start
                     if enable_profiling:
                         logger.info(f"Total FFMPEG time: {ffmpeg_time:.2f}s, Total OCR processing time: {ocr_time:.2f}s")
                     if return_details:
-                        return (media_file, matched_episode, timestamp, full_res_text)
+                        return (media_file, matched_episode, timestamp, extracted_text)
                     else:
                         return (media_file, matched_episode)
 

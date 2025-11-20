@@ -39,8 +39,8 @@ from rich.panel import Panel
 
 from ocrnmr import find_episode_by_title_card
 from ocrnmr import extract_text_from_frame, match_episode, match_episode_with_scores
-from ocrnmr.processor import FrameCache
 from ocrnmr.episode_fetcher import fetch_episodes, load_episodes_file
+from ocrnmr.profiler import profiler
 
 console = Console()
 
@@ -175,25 +175,8 @@ def test_single_file(test_file_config: dict, ocr_config: Dict, test_index: int =
     console.print("[bold yellow]Running OCR matching...[/bold yellow]\n")
     
     # Get pre-extracted frames from cache if available
-    # Note: frame_cache is passed via global variable set in main
+    # Legacy code removed: We now use streaming/generator approach
     pre_extracted_frames = None
-    if 'frame_cache' in globals() and globals()['frame_cache'] is not None:
-        frame_cache = globals()['frame_cache']
-        # Check if extraction was started for this file
-        with frame_cache.lock:
-            extraction_started = test_file in frame_cache.cache
-        
-        if extraction_started:
-            console.print(f"[dim]Retrieving frames from cache...[/dim]")
-            pre_extracted_frames = frame_cache.get_frames(test_file)
-            if pre_extracted_frames:
-                console.print(f"[green]✓ Got {len(pre_extracted_frames)} pre-extracted frames from cache[/green]")
-            else:
-                console.print(f"[yellow]⚠ Extraction failed or not ready, will extract synchronously[/yellow]")
-        else:
-            console.print(f"[dim]No extraction started for this file, extracting frames synchronously...[/dim]")
-    else:
-        console.print(f"[dim]No frame cache available, extracting frames synchronously...[/dim]")
     
     # Get start_time for extraction if specified
     start_time = test_file_config.get("start_time")
@@ -283,14 +266,17 @@ def test_single_file(test_file_config: dict, ocr_config: Dict, test_index: int =
             frame_interval=frame_interval,
             enable_profiling=enable_profiling,
             hwaccel=hwaccel,
-            pre_extracted_frames=pre_extracted_frames,
             start_time=start_time
         )
         
         # Display results
-        
+            
         if result:
-            matched_file, matched_episode, timestamp, extracted_text = result
+            matched_file, matched_episode = result[:2]
+            # If return_details=True, result will have more items, but we only care about first two for basic match
+            timestamp, extracted_text = None, None
+            if len(result) >= 4:
+                timestamp, extracted_text = result[2], result[3]
             
             # Check if match is expected
             is_expected = False
@@ -455,11 +441,36 @@ Examples:
         help="Episode matching threshold 0.0-1.0 (default: 0.65, lower = more lenient)"
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for OCR processing (default: 32)"
+    )
+    parser.add_argument(
+        "--min-dimension",
+        type=int,
+        default=320,
+        help="Minimum width/height for OCR first pass (default: 320)"
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="Enable profiling and write to specified JSON file"
+    )
+    parser.add_argument(
         "--hwaccel",
         type=str,
         default=None,
         choices=['videotoolbox', 'vaapi', 'd3d11va', 'dxva2'],
         help="Hardware acceleration: videotoolbox (macOS), vaapi (Linux), d3d11va/dxva2 (Windows). Default: None (software)"
+    )
+    
+    parser.add_argument(
+        "--max-dimension",
+        type=int,
+        default=800,
+        help="Maximum width/height for OCR (default: 800)"
     )
     
     # Debug/test-specific arguments
@@ -489,6 +500,10 @@ Examples:
     
     args = parser.parse_args()
     
+    # Enable profiling if requested
+    if args.profile:
+        profiler.enable(args.profile)
+
     # Load optional debug config file
     if args.config:
         CONFIG_FILE = Path(args.config).expanduser()
@@ -537,6 +552,9 @@ Examples:
         "frame_interval": args.frame_interval,
         "match_threshold": args.match_threshold,
         "hwaccel": args.hwaccel,
+        "batch_size": args.batch_size,
+        "min_dimension": args.min_dimension,
+        "max_dimension": args.max_dimension,
     }
     
     # Validate episodes file exists if provided
@@ -603,54 +621,18 @@ Examples:
     # Create list of file paths for index lookup
     file_paths_list = [Path(test_file_config.get("test_file", "")).expanduser() for test_file_config in test_files_config]
     
-    # Create frame cache for pipelined extraction
-    frame_cache = FrameCache(memory_limit_bytes=1073741824)  # 1GB limit
-    # Make frame_cache available to test_single_file via globals
-    globals()['frame_cache'] = frame_cache
-    
-    # Prepare extraction config from ocr_config
-    # Get start_time from first test file config (if specified)
-    start_time = None
-    if test_files_config and test_files_config[0].get("start_time") is not None:
-        start_time = test_files_config[0].get("start_time")
-    
-    extraction_config = {
-        "max_dimension": ocr_config.get("max_dimension"),
-        "duration": ocr_config.get("duration"),
-        "frame_interval": ocr_config.get("frame_interval", 2.0),
-        "hwaccel": ocr_config.get("hwaccel"),
-        "start_time": start_time
-    }
-    
-    # Start extraction for ALL files immediately - push ahead as fast as possible
-    # This allows FFmpeg to finish early and free resources for EasyOCR
-    if test_files_config:
-        for file_idx, test_file_config in enumerate(test_files_config):
-            file_path = Path(test_file_config.get("test_file", "")).expanduser()
-            # Use start_time and duration from individual file config if available
-            file_start_time = test_file_config.get("start_time")
-            file_duration = test_file_config.get("duration")
-            file_extraction_config = extraction_config.copy()
-            if file_start_time is not None:
-                file_extraction_config["start_time"] = file_start_time
-            if file_duration is not None:
-                file_extraction_config["duration"] = file_duration
-            frame_cache.start_extraction(file_path, file_extraction_config)
-    
     # Run all test files
     for idx, test_file_config in enumerate(test_files_config):
         test_file_path = Path(test_file_config.get("test_file", "")).expanduser()
         
-        # Process current file (frames should already be ready or will wait)
+        # Process current file
         success, matched_episode = test_single_file(test_file_config, ocr_config, test_index=idx, total_tests=total_tests)
         results.append(success)
         matches.append((test_file_path, matched_episode))
-        
-        # Clear frames from cache after processing
-        frame_cache.cleanup(test_file_path)
     
-    # Shutdown frame cache executor
-    frame_cache.shutdown()
+    # Save profile results if enabled
+    if args.profile:
+        profiler.save_results()
     
     # Generate rename preview data using show_name and season from CLI args
     # Import filename generation function

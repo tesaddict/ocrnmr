@@ -1,402 +1,316 @@
-"""Pipelined OCR processor with background frame extraction."""
+"""Sequential OCR processor with true streaming."""
 
 import logging
-import os
-import subprocess
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+import os
+import threading
+import queue
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Any
 
-from ocrnmr.frame_extractor import extract_frames_batch
-from ocrnmr.title_card_scanner import find_episode_by_title_card
+from ocrnmr.title_card_scanner import _load_image_from_bytes, _resize_image
+from ocrnmr.ocr_engine import extract_text_from_batch
+from ocrnmr.episode_matcher import match_episode
+from ocrnmr.display import OCRProgressDisplay
+from ocrnmr.filename import sanitize_filename
+from ocrnmr.frame_extractor import extract_frames_generator
+from ocrnmr.profiler import profiler
 
 logger = logging.getLogger(__name__)
 
-# Import FORCE_EXIT flag from exit_flag module
-from ocrnmr.exit_flag import FORCE_EXIT
 
-
-class FrameCache:
-    """Manages pipelined FFMPEG frame extraction with memory limits."""
+class StatusCallback:
+    """Status callback for video processing events."""
     
-    def __init__(self, memory_limit_bytes: int = 1073741824):  # 1GB default
-        self.memory_limit = memory_limit_bytes
-        self.cache: Dict[Path, Tuple[Future, int]] = {}  # {file_path: (future, memory_bytes)}
-        self.executor = ThreadPoolExecutor(max_workers=1)
-        self.lock = threading.Lock()
-        self.logger = logging.getLogger(__name__)
-        self.currently_extracting: Optional[Path] = None  # Track which file is actually being extracted right now
-        self.currently_extracting_index: Optional[int] = None
-        self.logger.info(f"FrameCache initialized with {memory_limit_bytes / 1024 / 1024:.0f}MB memory limit")
-    
-    def estimate_memory(self, frames: List[Tuple[float, bytes]]) -> int:
-        """Estimate memory usage of frame list in bytes."""
-        if not frames:
-            return 0
-        # Sum of frame bytes + ~10% overhead for list/tuple overhead
-        base_memory = sum(len(frame_bytes) for _, frame_bytes in frames)
-        return int(base_memory * 1.1)
-    
-    def get_total_memory(self) -> int:
-        """Get total memory used by all cached frames."""
-        with self.lock:
-            return sum(memory_bytes for _, memory_bytes in self.cache.values())
-    
-    def start_extraction(self, file_path: Path, config: Dict[str, Any], status_callback: Optional[Callable] = None, file_index: Optional[int] = None) -> None:
-        """Start background frame extraction for a file."""
-        with self.lock:
-            if file_path in self.cache:
-                # Already extracting or cached
-                return
-            
-            # Check if we have room (we'll check again when extraction completes)
-            future = self.executor.submit(self._extract_frames, file_path, config, status_callback, file_index)
-            # We don't know memory yet, so estimate conservatively
-            self.cache[file_path] = (future, 0)
-            self.logger.info(f"Queued background FFMPEG extraction for {file_path.name}")
-            # Don't show "Starting" message here - it will be shown when extraction actually starts in _extract_frames
-    
-    def _extract_frames(self, file_path: Path, config: Dict[str, Any], status_callback: Optional[Callable] = None, file_index: Optional[int] = None) -> List[Tuple[float, bytes]]:
-        """Extract frames in background thread."""
-        start_time = time.time()
-        
-        # Update currently extracting file
-        with self.lock:
-            self.currently_extracting = file_path
-            self.currently_extracting_index = file_index
-        
-        # Show start message when extraction actually begins
-        if status_callback:
-            status_callback('ffmpeg_start', file_index, str(file_path), 'decoding', f"Starting frame extraction for {file_path.name}", 'ffmpeg')
-        
-        try:
-            frames = extract_frames_batch(
-                file_path,
-                interval_seconds=config.get("frame_interval", 2.0),
-                # Always extract at full resolution; downscaling happens later in Python
-                max_dimension=None,
-                duration=config.get("duration"),
-                hwaccel=config.get("hwaccel"),
-                start_time=config.get("start_time")
-            )
-            extraction_time = time.time() - start_time
-            
-            # Update memory estimate
-            memory_bytes = self.estimate_memory(frames)
-            
-            with self.lock:
-                if file_path in self.cache:
-                    self.cache[file_path] = (self.cache[file_path][0], memory_bytes)
-                    total_memory = sum(mem_bytes for _, mem_bytes in self.cache.values())
-                    log_msg = (
-                        f"FFMPEG extraction completed for {file_path.name}: "
-                        f"{len(frames)} frames, ~{memory_bytes / 1024 / 1024:.1f}MB "
-                        f"(total cache: ~{total_memory / 1024 / 1024:.1f}MB)"
-                    )
-                    self.logger.info(log_msg)
-                    if status_callback:
-                        status_callback('ffmpeg_complete', file_index, str(file_path), 'finished', 
-                                      f"Frame extraction completed for {file_path.name} ({len(frames)} frames)", 'ffmpeg')
-            
-            # Clear currently extracting when done
-            with self.lock:
-                if self.currently_extracting == file_path:
-                    self.currently_extracting = None
-                    self.currently_extracting_index = None
-            
-            return frames
-        except Exception as e:
-            elapsed = time.time() - start_time
-            error_msg = f"Background extraction failed for {file_path.name} after {elapsed:.2f}s: {e}"
-            self.logger.error(error_msg)
-            with self.lock:
-                if file_path in self.cache:
-                    del self.cache[file_path]
-                if self.currently_extracting == file_path:
-                    self.currently_extracting = None
-                    self.currently_extracting_index = None
-            if status_callback:
-                status_callback('ffmpeg_error', file_index, str(file_path), 'standby', f"Error: {str(e)[:50]}", 'ffmpeg')
-            raise
-    
-    def get_frames(self, file_path: Path, status_callback: Optional[Callable] = None) -> Optional[List[Tuple[float, bytes]]]:
-        """Get frames for a file, waiting if extraction is in progress."""
-        with self.lock:
-            if file_path not in self.cache:
-                return None
-            
-            future, memory_bytes = self.cache[file_path]
-        
-        # Check if extraction is already complete
-        if future.done():
-            try:
-                frames = future.result()
-                return frames
-            except Exception as e:
-                error_msg = f"Error getting frames for {file_path.name}: {e}"
-                self.logger.error(error_msg)
-                with self.lock:
-                    if file_path in self.cache:
-                        del self.cache[file_path]
-                return None
-        
-        # Extraction still in progress - wait for it with timeout to allow interrupt checking
-        self.logger.info(f"Waiting for background FFMPEG extraction to complete for {file_path.name}...")
-        
-        try:
-            # Poll with very short timeout and check FORCE_EXIT flag
-            while not future.done():
-                # Check force exit flag first - if set, exit immediately
-                if FORCE_EXIT.is_set():
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                    os._exit(130)
-                
-                try:
-                    frames = future.result(timeout=0.01)  # Very short timeout (10ms) for quick interrupt response
-                    break
-                except TimeoutError:
-                    # Continue polling - allows FORCE_EXIT check on each iteration
-                    continue
-            
-            # Check force exit again before getting final result
-            if FORCE_EXIT.is_set():
-                try:
-                    future.cancel()
-                except Exception:
-                    pass
-                os._exit(130)
-            
-            # Get final result if not already got it
-            if not future.done():
-                frames = future.result(timeout=0.01)
-            else:
-                frames = future.result()
-            
-            # Check memory limit after extraction completes
-            try:
-                total_memory = self.get_total_memory()
-                if total_memory > self.memory_limit:
-                    self.logger.warning(
-                        f"Memory limit exceeded: {total_memory / 1024 / 1024:.1f}MB > "
-                        f"{self.memory_limit / 1024 / 1024:.1f}MB. "
-                        f"Consider reducing duration or frame_interval."
-                    )
-            except Exception:
-                pass
-            
-            return frames
-        except KeyboardInterrupt:
-            # Cancel the future and force exit immediately
-            FORCE_EXIT.set()
-            try:
-                future.cancel()
-            except Exception:
-                pass
-            with self.lock:
-                if file_path in self.cache:
-                    del self.cache[file_path]
-            os._exit(130)
-        except Exception as e:
-            error_msg = f"Error waiting for frames for {file_path.name}: {e}"
-            self.logger.error(error_msg)
-            with self.lock:
-                if file_path in self.cache:
-                    del self.cache[file_path]
-            return None
-    
-    def get_currently_extracting(self) -> Tuple[Optional[Path], Optional[int]]:
-        """Get the file that's currently being extracted."""
-        with self.lock:
-            return (self.currently_extracting, self.currently_extracting_index)
-    
-    def cleanup(self, file_path: Path) -> None:
-        """Remove frames from cache after processing."""
-        with self.lock:
-            if file_path in self.cache:
-                del self.cache[file_path]
-                self.logger.debug(f"Cleaned up frames for {file_path.name}")
-    
-    def shutdown(self, wait: bool = True) -> None:
-        """Shutdown the executor and cancel pending tasks aggressively."""
-        # Check force exit - if set, kill everything immediately
-        if FORCE_EXIT.is_set():
-            # Kill all FFMPEG processes immediately
-            try:
-                subprocess.run(['pkill', '-9', 'ffmpeg'], timeout=0.5, capture_output=True)
-            except Exception:
-                pass
-            # Don't wait for executor - just exit
-            os._exit(130)
-        
-        # Cancel all pending futures immediately
-        with self.lock:
-            for file_path, (future, _) in list(self.cache.items()):
-                if not future.done():
-                    future.cancel()
-                    self.logger.info(f"Cancelled extraction for {file_path.name}")
-        
-        # Kill any active FFMPEG processes aggressively (no wait)
-        try:
-            from ocrnmr.frame_extractor import _active_processes
-            for proc in list(_active_processes):
-                try:
-                    proc.kill()  # Kill immediately, don't wait
-                except Exception:
-                    pass
-            # Also use pkill as fallback
-            try:
-                subprocess.run(['pkill', '-9', 'ffmpeg'], timeout=0.5, capture_output=True)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        
-        # Shutdown executor - always use wait=False for immediate exit
-        try:
-            self.executor.shutdown(wait=False)
-        except Exception:
-            pass
-
-
-class PipelinedOCRProcessor:
-    """Processes video files with pipelined FFMPEG extraction."""
-    
-    def __init__(self, memory_limit_bytes: int = 1073741824):  # 1GB default
-        self.frame_cache = FrameCache(memory_limit_bytes)
-        self.logger = logging.getLogger(__name__)
-    
-    def process_files(
+    def __init__(
         self,
+        display: OCRProgressDisplay,
         video_files: List[Path],
-        episode_titles: List[str],
-        config: Dict[str, Any],
-        status_callback: Optional[Callable[[str, Optional[int], Optional[str], str, str, str], None]] = None,
-        should_continue: Optional[Callable[[], bool]] = None
-    ) -> List[Tuple[Path, Optional[str]]]:
-        """
-        Process video files with pipelined FFMPEG extraction.
+        episode_info: Optional[Dict[str, Tuple[int, int]]],
+        show_name: Optional[str]
+    ):
+        self.display = display
+        self.video_files = video_files
+        self.episode_info = episode_info
+        self.show_name = show_name
+        self.total_files = len(video_files)
+    
+    def update_status(self, file_index: int, file_path: str, status: str, message: str, match_timestamp: Optional[float] = None):
+        """Update status in display."""
+        self.display.update_status(
+            file=file_path,
+            index=file_index,
+            total=self.total_files,
+            status=status,
+            message=message
+        )
         
-        Args:
-            video_files: List of video file paths to process
-            episode_titles: List of episode titles to match against
-            config: Configuration dict with OCR settings (frame_interval, match_threshold, max_dimension, duration, hwaccel)
-            status_callback: Optional callback function(status_type, file_index, file_path, status, message)
-                           status_type: 'ffmpeg_start', 'ffmpeg_complete', 'ocr_start', 'ocr_complete', 'match_found'
+        if message:
+            self.display.add_log(message)
+            
+    def match_found(self, file_index: int, file_path: str, matched_episode: str, match_timestamp: Optional[float]):
+        """Handle match found event."""
+        new_filename = None
+        if matched_episode and self.episode_info and matched_episode in self.episode_info:
+            ep_season, ep_num = self.episode_info[matched_episode]
+            file_path_obj = Path(file_path)
+            ext = file_path_obj.suffix
+            new_filename = f"{self.show_name} - S{ep_season:02d}E{ep_num:02d} - {matched_episode}{ext}"
+            new_filename = sanitize_filename(new_filename)
         
-        Returns:
-            List of tuples (file_path, matched_episode_name or None)
-        """
-        matches = []
-        total_files = len(video_files)
+        message = f"Match found: {matched_episode}"
+        self.display.add_log(message)
+        self.display.add_completed_file(file_path, matched_episode, True, new_filename=new_filename, match_timestamp=match_timestamp)
+
+    def no_match(self, file_index: int, file_path: str):
+        """Handle no match event."""
+        message = f"No match found for {Path(file_path).name}"
+        self.display.add_log(message)
+        self.display.add_completed_file(file_path, None, False, new_filename=None, match_timestamp=None)
+
+    def error(self, file_index: int, file_path: str, error_msg: str):
+        """Handle error event."""
+        message = f"Error: {error_msg}"
+        self.display.add_log(message)
+        self.display.add_completed_file(file_path, None, False, new_filename=None, match_timestamp=None)
+
+
+def _process_batch_two_pass(
+    batch_frames: List[Tuple[float, bytes]],
+    episode_titles: List[str],
+    ocr_config: Dict,
+    use_heuristic_downscale: bool,
+    target_dimension: Optional[int]
+) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Process a batch of frames using two-pass OCR strategy.
+    
+    Pass 1: Low resolution (min_dimension) to detect text.
+    Pass 2: High resolution (max_dimension) on candidates to recognize text.
+    """
+    min_dimension = ocr_config.get('min_dimension', 320)
+    max_dimension = ocr_config.get('max_dimension', 800)
+    match_threshold = ocr_config.get('match_threshold', 0.6)
+    
+    # --- PASS 1: Low Resolution Filter ---
+    pass1_images = []
+    pass1_indices = []
+    
+    profiler.start_timer("load_and_resize_pass1")
+    for i, (ts, fb) in enumerate(batch_frames):
+        try:
+            image = _load_image_from_bytes(fb)
+            # Resize to min_dimension for fast detection
+            image_small = _resize_image(image, min_dimension)
+            pass1_images.append(image_small)
+            pass1_indices.append(i)
+        except Exception:
+            continue
+    profiler.stop_timer("load_and_resize_pass1")
+            
+    if not pass1_images:
+        return None, None
         
-        # Normalize config values
-        ocr_config = {
-            'frame_interval': config.get("frame_interval", 2.0),
-            'match_threshold': config.get("match_threshold", 0.6),
-            'duration': config.get("duration"),
-            'hwaccel': config.get("hwaccel"),
-            'start_time': config.get("start_time"),
-        }
+    # Run OCR on small images - use very low confidence (0.1) to just detect *any* text
+    profiler.start_timer("ocr_pass1")
+    pass1_texts = extract_text_from_batch(pass1_images, decoder='greedy', min_confidence=0.1)
+    profiler.stop_timer("ocr_pass1")
+    
+    # Check for immediate matches or candidates
+    candidate_indices = []
+    
+    profiler.start_timer("match_pass1")
+    for i, text in enumerate(pass1_texts):
+        if text:
+            # Check if we got lucky and matched on low-res (unlikely but possible)
+            matched = match_episode(text, episode_titles, threshold=match_threshold)
+            if matched:
+                profiler.stop_timer("match_pass1")
+                original_idx = pass1_indices[i]
+                return matched, batch_frames[original_idx][0]
+            
+            # If text detected but no match, mark as candidate
+            candidate_indices.append(pass1_indices[i])
+    profiler.stop_timer("match_pass1")
+            
+    if not candidate_indices:
+        return None, None
         
-        # Handle None/0 values
-        if ocr_config['duration'] is not None and ocr_config['duration'] == 0:
-            ocr_config['duration'] = None
+    # --- PASS 2: High Resolution Refinement ---
+    pass2_images = []
+    pass2_timestamps = []
+    
+    profiler.start_timer("load_and_resize_pass2")
+    for idx in candidate_indices:
+        ts, fb = batch_frames[idx]
+        try:
+            image = _load_image_from_bytes(fb)
+            # Resize to max_dimension (or heuristic) for accurate recognition
+            if use_heuristic_downscale and target_dimension:
+                image = _resize_image(image, target_dimension)
+            elif max_dimension:
+                image = _resize_image(image, max_dimension)
+                
+            pass2_images.append(image)
+            pass2_timestamps.append(ts)
+        except Exception:
+            continue
+    profiler.stop_timer("load_and_resize_pass2")
+            
+    if not pass2_images:
+        return None, None
         
-        # Start extraction for all files upfront (FFMPEG runs ahead without waiting)
+    # Run OCR on candidate images (high res)
+    profiler.start_timer("ocr_pass2")
+    pass2_texts = extract_text_from_batch(pass2_images, decoder='greedy', min_confidence=0.3)
+    profiler.stop_timer("ocr_pass2")
+    
+    profiler.start_timer("match_pass2")
+    for i, text in enumerate(pass2_texts):
+        if text:
+            matched = match_episode(text, episode_titles, threshold=match_threshold)
+            if matched:
+                profiler.stop_timer("match_pass2")
+                return matched, pass2_timestamps[i]
+    profiler.stop_timer("match_pass2")
+                
+    return None, None
+
+
+def process_video_files(
+    input_directory: Path,
+    episode_titles: List[str],
+    ocr_config: Dict,
+    display: OCRProgressDisplay,
+    episode_info: Optional[Dict[str, Tuple[int, int]]] = None,
+    show_name: Optional[str] = None
+) -> List[Tuple[Path, Optional[str]]]:
+    """
+    Process video files and match episodes using true streaming.
+    """
+    # Get video files
+    extensions = ['*.mkv', '*.mp4', '*.avi', '*.m4v', '*.mov']
+    video_files = []
+    for ext in extensions:
+        video_files.extend(input_directory.glob(ext))
+    # Add uppercase versions just in case (Linux is case sensitive)
+    for ext in extensions:
+        video_files.extend(input_directory.glob(ext.upper()))
+        
+    video_files = sorted(list(set(video_files)))
+    
+    if not video_files:
+        display.add_log(f"No video files found in {input_directory} (checked mkv, mp4, avi, m4v, mov)")
+        return []
+    
+    total_files = len(video_files)
+    display.add_log(f"Found {total_files} video files")
+    display.total_files = total_files
+    
+    # Create status callback
+    callback = StatusCallback(display, video_files, episode_info, show_name)
+    
+    # Mark OCR start time
+    display.ocr_start_time = time.time()
+    
+    matches = []
+    
+    try:
         for idx, video_file in enumerate(video_files):
-            self.frame_cache.start_extraction(video_file, ocr_config, status_callback, idx)
-        
-        # Process each file - FFMPEG extractions are already running in background
-        for idx, video_file in enumerate(video_files):
-            # Check if we should continue processing (check before each file)
-            if should_continue and not should_continue():
-                self.logger.info("Early exit requested, stopping processing")
-                if status_callback:
-                    status_callback('ocr_complete', idx - 1 if idx > 0 else 0, None, 'finished', 
-                                  "Early exit requested by user", 'ocr')
+            # Check for early exit
+            if display.early_exit_requested:
+                display.add_log("Early exit requested, stopping processing")
                 break
             
             file_path_str = str(video_file)
-            
-            # Wait for current file's frames to be ready (extraction may already be complete)
-            if status_callback:
-                status_callback('ocr_start', idx, file_path_str, 'standby', f"Starting processing: {video_file.name}", 'ocr')
-            
-            pre_extracted_frames = self.frame_cache.get_frames(video_file, status_callback)
-            
-            if pre_extracted_frames is None:
-                # Extraction failed or not started, fall back to inline extraction
-                self.logger.warning(f"Could not get pre-extracted frames for {video_file.name}, using inline extraction")
-                if status_callback:
-                    status_callback('ocr_start', idx, file_path_str, 'standby', 
-                                  f"Warning: Using inline extraction for {video_file.name}", 'ocr')
-                pre_extracted_frames = None
-            
-            # Process OCR
-            if status_callback:
-                status_callback('ocr_start', idx, file_path_str, 'processing', f"Processing OCR for {video_file.name}", 'ocr')
+            callback.update_status(idx, file_path_str, "processing", f"Processing {video_file.name}")
             
             try:
-                result = find_episode_by_title_card(
+                matched_episode = None
+                match_timestamp = None
+                
+                # Batch size for OCR
+                BATCH_SIZE = ocr_config.get('batch_size', 32)
+                
+                frame_count = 0
+                use_heuristic_downscale = (ocr_config.get('max_dimension') is None)
+                target_dimension = None
+                
+                # Start generator
+                frame_generator = extract_frames_generator(
                     video_file,
-                    episode_titles,
-                    match_threshold=ocr_config['match_threshold'],
-                    return_details=True,  # Return timestamp for display
-                    duration=ocr_config['duration'],
-                    frame_interval=ocr_config['frame_interval'],
-                    enable_profiling=False,
-                    hwaccel=ocr_config['hwaccel'],
-                    pre_extracted_frames=pre_extracted_frames,
-                    start_time=ocr_config.get("start_time")
+                    interval_seconds=ocr_config.get('frame_interval', 2.0),
+                    max_dimension=ocr_config.get('max_dimension'),
+                    duration=ocr_config.get('duration'),
+                    hwaccel=ocr_config.get('hwaccel'),
+                    start_time=ocr_config.get('start_time')
                 )
                 
-                if result:
-                    # When return_details=True, result is (media_file, episode_name, timestamp, extracted_text)
-                    if len(result) == 4:
-                        _, matched_episode, match_timestamp, _ = result
-                    else:
-                        # Fallback for old format (shouldn't happen with return_details=True)
-                        matched_episode = result[1] if len(result) >= 2 else None
-                        match_timestamp = result[2] if len(result) >= 3 else None
+                # Process frames in batches as they arrive
+                current_batch_frames = []
+                
+                for timestamp, frame_bytes in frame_generator:
+                    current_batch_frames.append((timestamp, frame_bytes))
                     
+                    # Determine target dimension once if using heuristic
+                    if use_heuristic_downscale and target_dimension is None:
+                        try:
+                            image = _load_image_from_bytes(frame_bytes)
+                            width, height = image.size
+                            longest_side = max(width, height)
+                            computed = int(longest_side / 2)
+                            if computed > 0 and computed < longest_side:
+                                target_dimension = computed
+                        except Exception:
+                            pass
+
+                    if len(current_batch_frames) >= BATCH_SIZE:
+                        # Process batch with two-pass strategy
+                        matched_episode, match_timestamp = _process_batch_two_pass(
+                            current_batch_frames,
+                            episode_titles,
+                            ocr_config,
+                            use_heuristic_downscale,
+                            target_dimension
+                        )
+                        
+                        frame_count += len(current_batch_frames)
+                        current_batch_frames = []
+                        
+                        if matched_episode:
+                            # Stop generator (will kill FFMPEG process on garbage collection or exit)
+                            break
+                
+                # Process remaining frames in last batch
+                if not matched_episode and current_batch_frames:
+                    matched_episode, match_timestamp = _process_batch_two_pass(
+                        current_batch_frames,
+                        episode_titles,
+                        ocr_config,
+                        use_heuristic_downscale,
+                        target_dimension
+                    )
+                    frame_count += len(current_batch_frames)
+                
+                if matched_episode:
                     matches.append((video_file, matched_episode))
-                    if status_callback:
-                        status_callback('match_found', idx, file_path_str, 'finished', f"Match found: {matched_episode}", 'ocr', match_timestamp=match_timestamp)
-                        status_callback('ocr_complete', idx, file_path_str, 'finished', f"Completed: {video_file.name}", 'ocr')
+                    callback.match_found(idx, file_path_str, matched_episode, match_timestamp)
                 else:
                     matches.append((video_file, None))
-                    if status_callback:
-                        status_callback('ocr_complete', idx, file_path_str, 'finished', f"No match found for {video_file.name}", 'ocr')
-                        # Also signal no match for display
-                        status_callback('match_found', idx, file_path_str, 'finished', f"No match found for {video_file.name}", 'ocr', match_timestamp=None)
-                
+                    callback.no_match(idx, file_path_str)
+                    
             except Exception as e:
-                self.logger.error(f"Error processing {video_file.name}: {e}")
+                logger.error(f"Error processing {video_file.name}: {e}")
                 matches.append((video_file, None))
-                if status_callback:
-                    status_callback('ocr_complete', idx, file_path_str, 'finished', f"Error processing {video_file.name}: {str(e)[:50]}", 'ocr')
-                    # Also signal error for display
-                    status_callback('match_found', idx, file_path_str, 'finished', f"Error processing {video_file.name}: {str(e)[:50]}", 'ocr')
-            
-            # Clean up frames after processing
-            self.frame_cache.cleanup(video_file)
-        
-        # Shutdown executor - always use wait=False for immediate exit
-        try:
-            self.frame_cache.shutdown(wait=False)
-        except KeyboardInterrupt:
-            # Force exit on interrupt
-            FORCE_EXIT.set()
-            os._exit(130)
-        except Exception:
-            # If shutdown fails, force exit
-            FORCE_EXIT.set()
-            os._exit(130)
-        
-        return matches
-
+                callback.error(idx, file_path_str, str(e))
+                
+    except KeyboardInterrupt:
+        display.add_log("Processing interrupted by user")
+        raise
+    finally:
+        display.ocr_end_time = time.time()
+        display.update_status(total_files, "", "finished", "Processing complete")
+    
+    return matches

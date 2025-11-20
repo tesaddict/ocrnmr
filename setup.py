@@ -24,6 +24,11 @@ setup(
         "requests>=2.25.0",
         "rich>=12.0.0",
     ],
+    extras_require={
+        "dev": [
+            "pytest>=7.0.0",
+        ],
+    },
     entry_points={
         "console_scripts": [
             "ocrnmr=ocrnmr.__main__:main",

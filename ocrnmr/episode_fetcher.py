@@ -39,19 +39,19 @@ def get_tmdb_episodes(show_name: str, season: int, api_key: Optional[str], displ
     
     if not api_key:
         if display:
-            display.add_ocr_diagnostic("TMDB API key not provided, skipping TMDB lookup")
+            display.add_log("TMDB API key not provided, skipping TMDB lookup")
         return [], {}
     
     try:
         if display:
-            display.add_ocr_diagnostic(f"Fetching episodes from TMDB for {show_name} Season {season}...")
+            display.add_log(f"Fetching episodes from TMDB for {show_name} Season {season}...")
         
         client = TMDBClient(api_key=api_key)
         episode_info_list = client.get_episode_info(show_name, season)
         
         if not episode_info_list:
             if display:
-                display.add_ocr_diagnostic("No episodes found in TMDB")
+                display.add_log("No episodes found in TMDB")
             return [], {}
         
         # Build titles list and info dict
@@ -62,7 +62,7 @@ def get_tmdb_episodes(show_name: str, season: int, api_key: Optional[str], displ
             info_dict[ep_title] = (season, ep_num)
         
         if display:
-            display.add_ocr_diagnostic(f"Found {len(titles)} episodes from TMDB")
+            display.add_log(f"Found {len(titles)} episodes from TMDB")
         
         return titles, info_dict
         
@@ -70,17 +70,17 @@ def get_tmdb_episodes(show_name: str, season: int, api_key: Optional[str], displ
         if hasattr(e, 'response') and e.response.status_code == 401:
             error_msg = "Invalid TMDB API key (401 Unauthorized)"
             if display:
-                display.add_ocr_diagnostic(f"Error: {error_msg}")
+                display.add_log(f"Error: {error_msg}")
             raise ValueError(error_msg) from e
         else:
             error_msg = f"TMDB API error: {e}"
             if display:
-                display.add_ocr_diagnostic(error_msg)
+                display.add_log(error_msg)
             raise ValueError(error_msg) from e
     except Exception as e:
         error_msg = f"Error accessing TMDB: {e}"
         if display:
-            display.add_ocr_diagnostic(error_msg)
+            display.add_log(error_msg)
         raise ValueError(error_msg) from e
 
 
@@ -161,7 +161,7 @@ def fetch_episodes(
                     all_info[title] = info
             
             if display:
-                display.add_ocr_diagnostic(f"Added {len(manual_titles)} manual episode titles")
+                display.add_log(f"Added {len(manual_titles)} manual episode titles")
     
     # Validate we have episodes
     if not all_titles:
@@ -180,7 +180,7 @@ def fetch_episodes(
         
         if display:
             display.show_error(error_msg)
-            display.add_ocr_diagnostic("ERROR: No episode titles found")
+            display.add_log("ERROR: No episode titles found")
             import time
             time.sleep(5.0)
         else:
