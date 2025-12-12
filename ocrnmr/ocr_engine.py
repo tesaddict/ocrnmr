@@ -33,13 +33,14 @@ EASYOCR_READER = None
 logger = logging.getLogger(__name__)
 
 
-def initialize_reader(gpu: Optional[bool] = None, quantize: bool = True) -> None:
+def initialize_reader(gpu: Optional[bool] = None, quantize: bool = True, verbose: bool = True) -> None:
     """
     Initialize EasyOCR reader with GPU acceleration if available.
     
     Args:
         gpu: Use GPU acceleration (default: auto-detect)
         quantize: Use dynamic quantization (default: True)
+        verbose: Print initialization status (default: True)
     """
     global EASYOCR_READER
     
@@ -53,20 +54,28 @@ def initialize_reader(gpu: Optional[bool] = None, quantize: bool = True) -> None
     if gpu is None:
         if torch is not None and torch.cuda.is_available():
             gpu = True
-            logger.info("EasyOCR: Using CUDA (NVIDIA GPU)")
+            if verbose: logger.info("EasyOCR: Using CUDA (NVIDIA/ROCm GPU)")
         elif torch is not None and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             gpu = True
-            logger.info("EasyOCR: Using MPS (Apple Silicon GPU)")
+            if verbose: logger.info("EasyOCR: Using MPS (Apple Silicon GPU)")
         else:
             gpu = False
-            logger.info("EasyOCR: Using CPU (No GPU detected)")
+            if verbose: logger.info("EasyOCR: Using CPU (No GPU detected)")
     else:
-        logger.info(f"EasyOCR: Using {'GPU' if gpu else 'CPU'} (Manual override)")
+        if verbose: logger.info(f"EasyOCR: Using {'GPU' if gpu else 'CPU'} (Manual override)")
     
     try:
         # quantize default is True in easyocr, but we expose it here
         EASYOCR_READER = easyocr.Reader(['en'], gpu=gpu, quantize=quantize)
     except Exception as e:
+        # Fallback to CPU if GPU initialization fails
+        if gpu:
+            if verbose: logger.warning(f"EasyOCR: GPU initialization failed ({e}), falling back to CPU")
+            try:
+                EASYOCR_READER = easyocr.Reader(['en'], gpu=False, quantize=quantize)
+                return
+            except Exception as e2:
+                raise RuntimeError(f"Failed to initialize EasyOCR (CPU fallback also failed): {str(e2)}") from e2
         raise RuntimeError(f"Failed to initialize EasyOCR: {str(e)}") from e
 
 
@@ -165,6 +174,23 @@ def extract_text_from_batch(
         
     except Exception:
         return [None] * len(frames)
+
+
+
+def clear_gpu_memory():
+    """Clear GPU memory if using CUDA or MPS."""
+    if not has_easyocr or torch is None:
+        return
+        
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+             # MPS doesn't have an explicit empty_cache equivalent in stable, but we can try collecting garbage
+             pass
+    except Exception:
+        pass
 
 
 def extract_text_from_frame(frame: Union[bytes, "Image.Image"]) -> Optional[str]:

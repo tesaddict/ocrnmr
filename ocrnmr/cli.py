@@ -70,8 +70,10 @@ Examples:
     parser.add_argument("--max-dimension", type=int, default=800, help="Maximum width/height for OCR (default: 800)")
     parser.add_argument("--min-dimension", type=int, default=320, help="Minimum width/height for OCR first pass (default: 320)")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for OCR processing (default: 32)")
+    parser.add_argument("--ocr-device", type=str, default="auto", choices=["auto", "gpu", "cpu"], help="Force OCR device usage (default: auto)")
+    parser.add_argument("--save-match-screenshot", action="store_true", help="Save screenshot of matched frame to matched_screenshots directory")
     parser.add_argument("--profile", type=str, default=None, help="Enable profiling and write to specified JSON file")
-    parser.add_argument("--hwaccel", type=str, default=None, choices=['videotoolbox', 'vaapi', 'd3d11va', 'dxva2'], help="Hardware acceleration")
+    parser.add_argument("--hwaccel", type=str, default=None, choices=['videotoolbox', 'vaapi', 'd3d11va', 'dxva2', 'cuda', 'auto'], help="FFmpeg Hardware acceleration")
     
     args = parser.parse_args()
     
@@ -79,6 +81,17 @@ Examples:
     
     if args.profile:
         profiler.enable(args.profile)
+    
+    # Map ocr-device to boolean or None
+    ocr_gpu = None
+    
+    # If hwaccel is cuda and ocr-device is auto, default to gpu
+    if args.hwaccel == 'cuda' and args.ocr_device == 'auto':
+        ocr_gpu = True
+    elif args.ocr_device == "gpu":
+        ocr_gpu = True
+    elif args.ocr_device == "cpu":
+        ocr_gpu = False
     
     ocr_config = {
         "duration": args.duration if args.duration > 0 else None,
@@ -88,6 +101,8 @@ Examples:
         "min_dimension": args.min_dimension,
         "batch_size": args.batch_size,
         "hwaccel": args.hwaccel,
+        "gpu": ocr_gpu,
+        "save_match_screenshot": args.save_match_screenshot,
     }
     
     if args.episodes_file:

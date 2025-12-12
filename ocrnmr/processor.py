@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Any
 
 from ocrnmr.title_card_scanner import _load_image_from_bytes, _resize_image
-from ocrnmr.ocr_engine import extract_text_from_batch
+from ocrnmr.ocr_engine import extract_text_from_batch, initialize_reader, clear_gpu_memory
 from ocrnmr.episode_matcher import match_episode
 from ocrnmr.display import OCRProgressDisplay
 from ocrnmr.filename import sanitize_filename
@@ -83,7 +83,7 @@ def _process_batch_two_pass(
     ocr_config: Dict,
     use_heuristic_downscale: bool,
     target_dimension: Optional[int]
-) -> Tuple[Optional[str], Optional[float]]:
+) -> Tuple[Optional[str], Optional[float], Optional[bytes]]:
     """
     Process a batch of frames using two-pass OCR strategy.
     
@@ -111,7 +111,7 @@ def _process_batch_two_pass(
     profiler.stop_timer("load_and_resize_pass1")
             
     if not pass1_images:
-        return None, None
+        return None, None, None
         
     # Run OCR on small images - use very low confidence (0.1) to just detect *any* text
     profiler.start_timer("ocr_pass1")
@@ -129,18 +129,19 @@ def _process_batch_two_pass(
             if matched:
                 profiler.stop_timer("match_pass1")
                 original_idx = pass1_indices[i]
-                return matched, batch_frames[original_idx][0]
+                return matched, batch_frames[original_idx][0], batch_frames[original_idx][1]
             
             # If text detected but no match, mark as candidate
             candidate_indices.append(pass1_indices[i])
     profiler.stop_timer("match_pass1")
             
     if not candidate_indices:
-        return None, None
+        return None, None, None
         
     # --- PASS 2: High Resolution Refinement ---
     pass2_images = []
     pass2_timestamps = []
+    pass2_indices = []  # Keep track of original indices to retrieve frame bytes
     
     profiler.start_timer("load_and_resize_pass2")
     for idx in candidate_indices:
@@ -155,12 +156,13 @@ def _process_batch_two_pass(
                 
             pass2_images.append(image)
             pass2_timestamps.append(ts)
+            pass2_indices.append(idx)
         except Exception:
             continue
     profiler.stop_timer("load_and_resize_pass2")
             
     if not pass2_images:
-        return None, None
+        return None, None, None
         
     # Run OCR on candidate images (high res)
     profiler.start_timer("ocr_pass2")
@@ -173,10 +175,11 @@ def _process_batch_two_pass(
             matched = match_episode(text, episode_titles, threshold=match_threshold)
             if matched:
                 profiler.stop_timer("match_pass2")
-                return matched, pass2_timestamps[i]
+                original_idx = pass2_indices[i]
+                return matched, pass2_timestamps[i], batch_frames[original_idx][1]
     profiler.stop_timer("match_pass2")
                 
-    return None, None
+    return None, None, None
 
 
 def process_video_files(
@@ -212,6 +215,14 @@ def process_video_files(
     # Create status callback
     callback = StatusCallback(display, video_files, episode_info, show_name)
     
+    # Initialize OCR engine with config
+    try:
+        initialize_reader(gpu=ocr_config.get('gpu'))
+    except Exception as e:
+        logger.error(f"Failed to initialize OCR engine: {e}")
+        # We don't exit here, we let individual file processing fail if it must, 
+        # but usually initialize_reader falls back to CPU or raises.
+    
     # Mark OCR start time
     display.ocr_start_time = time.time()
     
@@ -230,6 +241,7 @@ def process_video_files(
             try:
                 matched_episode = None
                 match_timestamp = None
+                match_frame_bytes = None
                 
                 # Batch size for OCR
                 BATCH_SIZE = ocr_config.get('batch_size', 32)
@@ -268,7 +280,7 @@ def process_video_files(
 
                     if len(current_batch_frames) >= BATCH_SIZE:
                         # Process batch with two-pass strategy
-                        matched_episode, match_timestamp = _process_batch_two_pass(
+                        matched_episode, match_timestamp, match_frame_bytes = _process_batch_two_pass(
                             current_batch_frames,
                             episode_titles,
                             ocr_config,
@@ -285,7 +297,7 @@ def process_video_files(
                 
                 # Process remaining frames in last batch
                 if not matched_episode and current_batch_frames:
-                    matched_episode, match_timestamp = _process_batch_two_pass(
+                    matched_episode, match_timestamp, match_frame_bytes = _process_batch_two_pass(
                         current_batch_frames,
                         episode_titles,
                         ocr_config,
@@ -297,14 +309,37 @@ def process_video_files(
                 if matched_episode:
                     matches.append((video_file, matched_episode))
                     callback.match_found(idx, file_path_str, matched_episode, match_timestamp)
+                    
+                    # Save screenshot if requested
+                    if ocr_config.get('save_match_screenshot') and match_frame_bytes:
+                        try:
+                            screenshots_dir = input_directory / "matched_screenshots"
+                            screenshots_dir.mkdir(exist_ok=True)
+                            
+                            safe_episode_name = sanitize_filename(matched_episode)
+                            screenshot_filename = f"{safe_episode_name}.jpg"
+                            screenshot_path = screenshots_dir / screenshot_filename
+                            
+                            with open(screenshot_path, "wb") as f:
+                                f.write(match_frame_bytes)
+                                
+                            display.add_log(f"Saved screenshot: {screenshot_filename}")
+                        except Exception as e:
+                            logger.error(f"Failed to save screenshot: {e}")
+                            display.add_log(f"Error saving screenshot: {e}")
                 else:
                     matches.append((video_file, None))
                     callback.no_match(idx, file_path_str)
+                
+                # Clear GPU memory after each file processing
+                clear_gpu_memory()
                     
             except Exception as e:
                 logger.error(f"Error processing {video_file.name}: {e}")
                 matches.append((video_file, None))
                 callback.error(idx, file_path_str, str(e))
+                # Try to clear memory even after error
+                clear_gpu_memory()
                 
     except KeyboardInterrupt:
         display.add_log("Processing interrupted by user")

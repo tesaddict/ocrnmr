@@ -160,35 +160,59 @@ def extract_frames_generator(
         frame_count = 0
         chunk_size = 65536  # 64KB chunks
         
-        while True:
-            chunk = process.stdout.read(chunk_size)
-            if not chunk:
-                break
+        try:
+            while True:
+                chunk = process.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                    
+                buffer.extend(chunk)
                 
-            buffer.extend(chunk)
-            
-            # Parse frames from buffer
-            profiler.start_timer("parse_mjpeg")
-            buffer, in_frame, frame_start, new_frames = _parse_mjpeg_frames_from_buffer(
-                buffer, interval_seconds, in_frame, frame_start, start_time, frame_count
-            )
-            profiler.stop_timer("parse_mjpeg")
-            
-            for frame in new_frames:
-                frame_count += 1
-                yield frame
+                # Parse frames from buffer
+                profiler.start_timer("parse_mjpeg")
+                buffer, in_frame, frame_start, new_frames = _parse_mjpeg_frames_from_buffer(
+                    buffer, interval_seconds, in_frame, frame_start, start_time, frame_count
+                )
+                profiler.stop_timer("parse_mjpeg")
                 
-        # Wait for process to finish
-        process.wait()
-        
-        profiler.stop_timer("ffmpeg_extract_generator")
-        
-        if process.returncode != 0:
-            # Check stderr for errors
-            stderr = process.stderr.read().decode('utf8', errors='ignore')
-            # Ignore SIGPIPE/SIGTERM if we stopped reading early
-            if process.returncode not in (-15, -13, 255):
-                logger.warning(f"FFmpeg exited with code {process.returncode}: {stderr[-200:]}")
+                for frame in new_frames:
+                    frame_count += 1
+                    yield frame
+                    
+            # Wait for process to finish
+            process.wait()
+            
+            profiler.stop_timer("ffmpeg_extract_generator")
+            
+            if process.returncode != 0:
+                # Check stderr for errors
+                stderr = process.stderr.read().decode('utf8', errors='ignore')
+                # Ignore SIGPIPE/SIGTERM if we stopped reading early
+                if process.returncode not in (-15, -13, 255):
+                    logger.warning(f"FFmpeg exited with code {process.returncode}: {stderr[-200:]}")
+
+        except GeneratorExit:
+            # Generator was closed explicitly
+            if process.poll() is None:
+                process.terminate()
+            raise
+        except Exception:
+            # Other exceptions
+            if process.poll() is None:
+                process.terminate()
+            raise
+        finally:
+            # Ensure cleanup
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=1.0)
+                except Exception:
+                    process.kill()
+            
+            # Close pipes
+            if process.stdout: process.stdout.close()
+            if process.stderr: process.stderr.close()
             
     except Exception as e:
         logger.error(f"Error in frame extraction generator: {e}")

@@ -113,6 +113,40 @@ def match_episode(
         
         # Use the best score from these strategies
         score = max(token_set_score, token_sort_score, full_score * 0.9)
+
+        # Word overlap check for multi-word titles to reduce false positives
+        # (e.g., "Satan City" matching "The Junior Champ... Mr. Satan")
+        if len(episode_words_list) > 3:
+            # Count how many meaningful words from episode title are present in extracted text
+            meaningful_ep_words = [w for w in episode_words_list if len(w) > 2]
+            
+            if meaningful_ep_words:
+                matched_words_count = 0
+                extracted_words_list = normalized_extracted.split()
+                
+                for ep_word in meaningful_ep_words:
+                    word_matched = False
+                    for ext_word in extracted_words_list:
+                        # Exact match
+                        if ext_word == ep_word:
+                            word_matched = True
+                            break
+                        # Fuzzy match for OCR errors
+                        if abs(len(ext_word) - len(ep_word)) <= 1:
+                            if fuzz.ratio(ep_word, ext_word) >= 85:
+                                word_matched = True
+                                break
+                    
+                    if word_matched:
+                        matched_words_count += 1
+                
+                overlap_ratio = matched_words_count / len(meaningful_ep_words)
+                
+                # Penalize if overlap is too low (less than 30%)
+                if overlap_ratio < 0.3:
+                    # DEBUG print commented out
+                    # print(f"DEBUG: Penalizing '{episode_name}' overlap={overlap_ratio:.2f} ({matched_words_count}/{len(meaningful_ep_words)}) score {score:.3f}->{score*0.5:.3f}")
+                    score *= 0.5
         
         if score > best_score:
             best_score = score
@@ -208,6 +242,38 @@ def match_episode_with_scores(
         full_score = fuzz.ratio(normalized_extracted, normalized_episode) / 100.0
         
         score = max(token_set_score, token_sort_score, full_score * 0.9)
+
+        # Word overlap check for multi-word titles to reduce false positives
+        if len(episode_words_list) > 3:
+            # Count how many meaningful words from episode title are present in extracted text
+            meaningful_ep_words = [w for w in episode_words_list if len(w) > 2]
+            
+            if meaningful_ep_words:
+                matched_words_count = 0
+                extracted_words_list = normalized_extracted.split()
+                
+                for ep_word in meaningful_ep_words:
+                    word_matched = False
+                    for ext_word in extracted_words_list:
+                        # Exact match
+                        if ext_word == ep_word:
+                            word_matched = True
+                            break
+                        # Fuzzy match for OCR errors
+                        if abs(len(ext_word) - len(ep_word)) <= 1:
+                            if fuzz.ratio(ep_word, ext_word) >= 85:
+                                word_matched = True
+                                break
+                    
+                    if word_matched:
+                        matched_words_count += 1
+                
+                overlap_ratio = matched_words_count / len(meaningful_ep_words)
+                
+                # Penalize if overlap is too low (less than 30%)
+                if overlap_ratio < 0.3:
+                    score *= 0.5
+
         scores[episode_name] = score
         
         if score > best_score:
@@ -219,4 +285,3 @@ def match_episode_with_scores(
         return (best_match, scores)
     
     return (None, scores)
-

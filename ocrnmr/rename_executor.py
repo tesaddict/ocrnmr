@@ -1,8 +1,10 @@
 """Rename preview and execution logic."""
 
 import time
+import uuid
+import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from rich.console import Console
 from rich.table import Table
@@ -103,32 +105,114 @@ def display_rename_preview(
     console.print()
 
 
+
+def _resolve_unique_path(target_path: Path, existing_paths: Set[Path]) -> Path:
+    """
+    Resolve a target path to be unique among existing paths by appending a counter.
+    
+    Args:
+        target_path: The desired target path
+        existing_paths: Set of paths that already exist or are reserved
+    
+    Returns:
+        A unique path
+    """
+    if target_path not in existing_paths and not target_path.exists():
+        return target_path
+        
+    # If path exists, append counter
+    base_name = target_path.stem
+    suffix = target_path.suffix
+    parent = target_path.parent
+    
+    counter = 1
+    while True:
+        new_name = f"{base_name} ({counter}){suffix}"
+        new_path = parent / new_name
+        if new_path not in existing_paths and not new_path.exists():
+            return new_path
+        counter += 1
+
+
 def execute_renames(
     rename_preview: List[Tuple[str, Optional[str], Optional[str]]], 
     input_directory: Path
 ):
-    """Execute file renames."""
+    """
+    Execute file renames atomically with temporary intermediate files.
+    
+    Strategy:
+    1. Rename all targets to temporary unique names (to handle case collisions and swaps).
+    2. Rename all temporary files to their final destination.
+    3. Handle duplicates by appending counters.
+    """
     console = Console()
     renamed_count = 0
+    
+    # Filter only files that need renaming
+    to_rename = []
     for original, new_name, _ in rename_preview:
-        if new_name:
-            original_path = input_directory / original
-            new_path = input_directory / new_name
+        if new_name and original != new_name:
+            to_rename.append((original, new_name))
             
-            # Skip if already renamed
-            if original_path.name == new_name:
-                continue
-            
-            # Check if target already exists
-            if new_path.exists():
-                console.print(f"[yellow]⚠[/yellow] Skipping {original}: target already exists")
-                continue
-            
-            try:
-                original_path.rename(new_path)
-                renamed_count += 1
-            except Exception as e:
-                console.print(f"[red]Error renaming {original}:[/red] {e}")
+    if not to_rename:
+        console.print("[yellow]No files to rename.[/yellow]")
+        return
+
+    console.print(f"[bold]Executing {len(to_rename)} renames...[/bold]")
+    
+    # Step 1: Rename to temporary files
+    temp_map: List[Tuple[Path, str]] = []  # List of (temp_path, final_name)
+    
+    try:
+        with console.status("[bold green]Phase 1: Renaming to temporary files..."):
+            for original, new_name in to_rename:
+                original_path = input_directory / original
+                
+                if not original_path.exists():
+                    console.print(f"[red]Error:[/red] File not found: {original}")
+                    continue
+                
+                # Create a unique temp name in the same directory
+                temp_name = f".tmp-{uuid.uuid4()}{original_path.suffix}"
+                temp_path = input_directory / temp_name
+                
+                try:
+                    original_path.rename(temp_path)
+                    temp_map.append((temp_path, new_name))
+                except Exception as e:
+                    console.print(f"[red]Error creating temp file for {original}:[/red] {e}")
+        
+        # Step 2: Rename from temp to final
+        # Track reserved paths to avoid collisions within this batch
+        reserved_paths: Set[Path] = set()
+        
+        with console.status("[bold green]Phase 2: Renaming to final filenames..."):
+            for temp_path, new_name in temp_map:
+                target_path = input_directory / new_name
+                
+                # Resolve conflicts
+                final_path = _resolve_unique_path(target_path, reserved_paths)
+                reserved_paths.add(final_path)
+                
+                try:
+                    temp_path.rename(final_path)
+                    renamed_count += 1
+                    
+                    # Log if we had to change the name due to conflict
+                    if final_path.name != new_name:
+                        console.print(f"[yellow]Conflict resolved:[/yellow] {new_name} -> {final_path.name}")
+                        
+                except Exception as e:
+                    console.print(f"[red]Error finalizing {new_name}:[/red] {e}")
+                    # Try to revert to original name if possible? 
+                    # It's hard to know original name here easily without storing it, 
+                    # but leaving it as .tmp is safer than overwriting something else.
+                    console.print(f"[yellow]File left at temporary path:[/yellow] {temp_path}")
+
+    except Exception as e:
+        console.print(f"[bold red]Critical Error during rename process:[/bold red] {e}")
     
     console.print(f"\n[green]✓[/green] Renamed {renamed_count} files")
+
 

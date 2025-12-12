@@ -462,8 +462,8 @@ Examples:
         "--hwaccel",
         type=str,
         default=None,
-        choices=['videotoolbox', 'vaapi', 'd3d11va', 'dxva2'],
-        help="Hardware acceleration: videotoolbox (macOS), vaapi (Linux), d3d11va/dxva2 (Windows). Default: None (software)"
+        choices=['videotoolbox', 'vaapi', 'd3d11va', 'dxva2', 'cuda'],
+        help="Hardware acceleration: videotoolbox (macOS), vaapi (Linux), d3d11va/dxva2 (Windows), cuda (NVIDIA). Default: None (software)"
     )
     
     parser.add_argument(
